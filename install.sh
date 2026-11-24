@@ -77,7 +77,9 @@ chown -R asterisk:asterisk "$ISSABEL_MOD_DIR"
 PBX_PARENT=$(sqlite3 /var/www/db/menu.db "SELECT IdParent FROM menu WHERE id IN ('pbxadmin','voicemail','conference','fop2') AND IdParent != '' LIMIT 1;")
 [ -z "$PBX_PARENT" ] && PBX_PARENT="pbxconfig"
 
-sqlite3 /var/www/db/menu.db "INSERT OR REPLACE INTO menu (id, IdParent, Link, Name, Type, order_no) VALUES ('live_operator_panel', '$PBX_PARENT', '', 'Live Operator Panel', 'module', 11);"
+# Remove any duplicate or old entries before inserting cleanly
+sqlite3 /var/www/db/menu.db "DELETE FROM menu WHERE Name='Live Operator Panel' OR id='live_operator_panel';"
+sqlite3 /var/www/db/menu.db "INSERT INTO menu (id, IdParent, Link, Name, Type, order_no) VALUES ('live_operator_panel', '$PBX_PARENT', '', 'Live Operator Panel', 'module', 11);"
 
 ID_RES=$(sqlite3 /var/www/db/acl.db "SELECT id FROM acl_resource WHERE name='live_operator_panel';")
 if [ -z "$ID_RES" ]; then
