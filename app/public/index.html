@@ -1,0 +1,529 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Live Operator Panel</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            darkMode: 'class'
+        };
+    </script>
+    <script src="/op-panel/socket.io/socket.io.js"></script>
+</head>
+<body class="bg-slate-50 text-slate-900 dark:bg-[#0b1120] dark:text-white p-4 pb-36 font-sans select-none transition-colors duration-200">
+
+    <!-- Header Section with Live Call Summary & Theme Toggle -->
+    <div class="flex flex-col lg:flex-row justify-between items-start lg:items-center mb-4 pb-3 border-b border-slate-200 dark:border-slate-800 gap-3">
+        <div>
+            <h1 class="text-lg font-bold tracking-tight text-slate-900 dark:text-white">Live Operator Panel (FOP2 Style)</h1>
+            <p class="text-slate-500 dark:text-slate-400 text-xs">Real-time extension & trunk monitor with caller/dialed ID, registration uptime, call timer & system telemetry.</p>
+        </div>
+
+        <div class="flex flex-wrap items-center gap-2">
+            <!-- Active Calls Counter -->
+            <div class="flex items-center gap-1.5 text-xs font-semibold bg-rose-50 text-rose-700 border border-rose-200 dark:bg-rose-950/60 dark:text-rose-300 dark:border-rose-800/70 px-2.5 py-1 rounded-full">
+                <span>Active Calls:</span>
+                <span id="stat-total-calls" class="font-mono font-bold">0</span>
+            </div>
+
+            <!-- Today's Processed Calls Counter -->
+            <div class="flex items-center gap-1.5 text-xs font-semibold bg-blue-50 text-blue-700 border border-blue-200 dark:bg-blue-950/60 dark:text-blue-300 dark:border-blue-800/70 px-2.5 py-1 rounded-full">
+                <span>Today's Processed Calls:</span>
+                <span id="stat-today-calls" class="font-mono font-bold">0</span>
+            </div>
+
+            <!-- Total Processed Calls Counter -->
+            <div class="flex items-center gap-1.5 text-xs font-semibold bg-indigo-50 text-indigo-700 border border-indigo-200 dark:bg-indigo-950/60 dark:text-indigo-300 dark:border-indigo-800/70 px-2.5 py-1 rounded-full">
+                <span>Total Processed Calls:</span>
+                <span id="stat-alltime-calls" class="font-mono font-bold">0</span>
+            </div>
+
+            <!-- Light / Dark Theme Toggle Button -->
+            <button id="theme-toggle" onclick="toggleTheme()" title="Switch Light / Dark Theme"
+                    class="flex items-center gap-1.5 text-xs font-semibold bg-white hover:bg-slate-100 text-slate-700 border border-slate-300 dark:bg-slate-800 dark:hover:bg-slate-700 dark:text-slate-200 dark:border-slate-700 px-3 py-1 rounded-full shadow-sm transition">
+                <span id="theme-icon">☀️</span>
+                <span id="theme-label">Light Mode</span>
+            </button>
+
+            <!-- AMI Connection Status Badge -->
+            <div class="flex items-center gap-2 text-xs font-medium text-emerald-700 bg-emerald-50 border border-emerald-200 dark:text-emerald-400 dark:bg-emerald-950/50 dark:border-emerald-800/60 px-3 py-1 rounded-full">
+                <span class="w-2 h-2 rounded-full bg-emerald-500 dark:bg-emerald-400 animate-pulse"></span>
+                <span>AMI Live Connected</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- Extensions Grid Section -->
+    <div class="mb-6">
+        <div class="flex items-center gap-2 mb-2.5">
+            <h2 class="text-xs font-bold uppercase tracking-wider text-slate-600 dark:text-slate-300">Extensions</h2>
+            <span id="ext-count" class="text-[11px] font-semibold bg-slate-200 text-slate-700 dark:bg-slate-800 dark:text-slate-300 px-2 py-0.5 rounded-full">0</span>
+        </div>
+        <div id="extension-grid" class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-2.5"></div>
+    </div>
+
+    <!-- SIP / IAX Trunks Grid Section -->
+    <div class="pt-4 border-t border-slate-200 dark:border-slate-800">
+        <div class="flex items-center gap-2 mb-2.5">
+            <h2 class="text-xs font-bold uppercase tracking-wider text-cyan-700 dark:text-cyan-400">SIP / IAX Trunks</h2>
+            <span id="trunk-count" class="text-[11px] font-semibold bg-slate-200 text-slate-700 dark:bg-slate-800 dark:text-slate-300 px-2 py-0.5 rounded-full">0</span>
+        </div>
+        <div id="trunk-grid" class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-2.5"></div>
+    </div>
+
+    <!-- Fixed Transparent Bottom-Right Server Telemetry & Clock Widget -->
+    <div id="sys-widget" class="fixed bottom-3 right-3 z-50 w-72 sm:w-80 rounded-xl backdrop-blur-md bg-white/75 dark:bg-slate-900/70 border border-slate-300/80 dark:border-slate-700/70 shadow-lg p-3 text-[11px] transition-all duration-200">
+        <div class="flex items-center justify-between pb-1.5 mb-2 border-b border-slate-200/80 dark:border-slate-700/70">
+            <div class="flex items-center gap-1.5 font-bold text-slate-800 dark:text-slate-100">
+                <span class="w-2 h-2 rounded-full bg-sky-500 animate-ping"></span>
+                <span>Server Monitor & Clock</span>
+            </div>
+            <button onclick="toggleWidgetBody()" id="widget-toggle-btn" class="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-slate-200/80 dark:bg-slate-800/80 text-slate-700 dark:text-slate-300 hover:opacity-80">
+                Hide
+            </button>
+        </div>
+
+        <div id="sys-widget-body" class="space-y-1.5">
+            <!-- Real-Time Date, Time & Location -->
+            <div class="bg-slate-100/80 dark:bg-slate-950/60 rounded-lg px-2 py-1.5 border border-slate-200/70 dark:border-slate-800/70">
+                <div class="flex justify-between items-center">
+                    <span id="live-clock" class="font-mono font-bold text-xs text-blue-700 dark:text-sky-400">--:--:--</span>
+                    <span id="live-date" class="font-mono text-[10px] text-slate-600 dark:text-slate-300">---</span>
+                </div>
+                <div class="flex items-center justify-between mt-0.5 text-[10px] text-slate-500 dark:text-slate-400">
+                    <span>Location:</span>
+                    <span id="sys-location" class="font-semibold text-slate-700 dark:text-slate-200 truncate max-w-[170px]">Detecting...</span>
+                </div>
+            </div>
+
+            <!-- CPU & RAM Usage -->
+            <div class="grid grid-cols-2 gap-1.5">
+                <div class="bg-slate-100/80 dark:bg-slate-950/60 rounded-lg px-2 py-1 border border-slate-200/70 dark:border-slate-800/70">
+                    <div class="flex justify-between text-[10px] text-slate-500 dark:text-slate-400">
+                        <span>CPU</span>
+                        <span id="sys-cpu-cores" class="font-mono">- Cores</span>
+                    </div>
+                    <div id="sys-cpu-val" class="font-mono font-bold text-xs text-emerald-700 dark:text-emerald-400 mt-0.5">0%</div>
+                </div>
+                <div class="bg-slate-100/80 dark:bg-slate-950/60 rounded-lg px-2 py-1 border border-slate-200/70 dark:border-slate-800/70">
+                    <div class="flex justify-between text-[10px] text-slate-500 dark:text-slate-400">
+                        <span>RAM</span>
+                        <span id="sys-ram-pct" class="font-mono font-bold text-indigo-700 dark:text-indigo-400">0%</span>
+                    </div>
+                    <div id="sys-ram-val" class="font-mono font-semibold text-[10px] text-slate-700 dark:text-slate-200 mt-0.5 truncate">0 / 0 GB</div>
+                </div>
+            </div>
+
+            <!-- Storage Usage & Free -->
+            <div class="bg-slate-100/80 dark:bg-slate-950/60 rounded-lg px-2 py-1 border border-slate-200/70 dark:border-slate-800/70 flex items-center justify-between">
+                <span class="text-slate-500 dark:text-slate-400">Storage:</span>
+                <span id="sys-disk-val" class="font-mono font-semibold text-slate-800 dark:text-slate-200">Used: 0G | Free: 0G (0%)</span>
+            </div>
+
+            <!-- Server Local IP & Public IP -->
+            <div class="bg-slate-100/80 dark:bg-slate-950/60 rounded-lg px-2 py-1 border border-slate-200/70 dark:border-slate-800/70 space-y-0.5">
+                <div class="flex justify-between">
+                    <span class="text-slate-500 dark:text-slate-400">Server IP:</span>
+                    <span id="sys-local-ip" class="font-mono font-semibold text-slate-800 dark:text-slate-200">---</span>
+                </div>
+                <div class="flex justify-between">
+                    <span class="text-slate-500 dark:text-slate-400">Public IP:</span>
+                    <span id="sys-public-ip" class="font-mono font-semibold text-amber-700 dark:text-amber-300">---</span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Theme initialization and toggle logic
+        function applyTheme(theme) {
+            const htmlEl = document.documentElement;
+            const iconEl = document.getElementById('theme-icon');
+            const labelEl = document.getElementById('theme-label');
+
+            if (theme === 'light') {
+                htmlEl.classList.remove('dark');
+                if (iconEl) iconEl.innerText = '🌙';
+                if (labelEl) labelEl.innerText = 'Dark Mode';
+            } else {
+                htmlEl.classList.add('dark');
+                if (iconEl) iconEl.innerText = '☀️';
+                if (labelEl) labelEl.innerText = 'Light Mode';
+            }
+        }
+
+        function toggleTheme() {
+            const isCurrentlyDark = document.documentElement.classList.contains('dark');
+            const nextTheme = isCurrentlyDark ? 'light' : 'dark';
+            localStorage.setItem('op_panel_theme', nextTheme);
+            applyTheme(nextTheme);
+        }
+
+        const savedTheme = localStorage.getItem('op_panel_theme') || 'dark';
+        applyTheme(savedTheme);
+
+        // Toggle visibility of bottom-right system telemetry widget
+        function toggleWidgetBody() {
+            const body = document.getElementById('sys-widget-body');
+            const btn = document.getElementById('widget-toggle-btn');
+            if (body.classList.contains('hidden')) {
+                body.classList.remove('hidden');
+                btn.innerText = 'Hide';
+            } else {
+                body.classList.add('hidden');
+                btn.innerText = 'Show';
+            }
+        }
+
+        // Update real-time clock every second
+        function updateLiveClock() {
+            const now = new Date();
+            const clockEl = document.getElementById('live-clock');
+            const dateEl = document.getElementById('live-date');
+            if (clockEl) {
+                clockEl.innerText = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
+            }
+            if (dateEl) {
+                dateEl.innerText = now.toLocaleDateString([], { weekday: 'short', year: 'numeric', month: 'short', day: '2-digit' });
+            }
+        }
+        updateLiveClock();
+        setInterval(updateLiveClock, 1000);
+
+        const socket = io({ path: '/op-panel/socket.io' });
+        const activeTimers = {};
+        const regTimers = {};
+        const regCache = {};
+
+        function formatCallDuration(ms) {
+            const totalSec = Math.max(0, Math.floor(ms / 1000));
+            const hrs = Math.floor(totalSec / 3600);
+            const mins = Math.floor((totalSec % 3600) / 60);
+            const secs = totalSec % 60;
+            const pad = (n) => String(n).padStart(2, '0');
+            return hrs > 0 ? `${pad(hrs)}:${pad(mins)}:${pad(secs)}` : `${pad(mins)}:${pad(secs)}`;
+        }
+
+        function formatRegUptime(ms) {
+            const totalSec = Math.max(0, Math.floor(ms / 1000));
+            const days = Math.floor(totalSec / 86400);
+            const hrs = Math.floor((totalSec % 86400) / 3600);
+            const mins = Math.floor((totalSec % 3600) / 60);
+            const secs = totalSec % 60;
+            const pad = (n) => String(n).padStart(2, '0');
+            const timeStr = `${pad(hrs)}:${pad(mins)}:${pad(secs)}`;
+            return days > 0 ? `${days}d ${timeStr}` : timeStr;
+        }
+
+        setInterval(() => {
+            const now = Date.now();
+            Object.keys(activeTimers).forEach(peer => {
+                const startTime = activeTimers[peer];
+                const timerEl = document.getElementById(`timer-${peer}`);
+                if (startTime && timerEl) {
+                    timerEl.innerText = formatCallDuration(now - startTime);
+                }
+            });
+
+            Object.keys(regTimers).forEach(peer => {
+                const regSince = regTimers[peer];
+                const regTimeEl = document.getElementById(`regtime-${peer}`);
+                if (regSince && regTimeEl) {
+                    regTimeEl.innerText = `Up ${formatRegUptime(now - regSince)}`;
+                }
+            });
+        }, 1000);
+
+        // Update top header call counters (Active Calls, Today's Processed Calls, Total Processed Calls)
+        function updateCallSummaryUI(summary) {
+            if (!summary) return;
+            const activeEl = document.getElementById('stat-total-calls');
+            const todayEl = document.getElementById('stat-today-calls');
+            const totalEl = document.getElementById('stat-alltime-calls');
+            if (activeEl) activeEl.innerText = (summary.totalActive ?? 0).toLocaleString();
+            if (todayEl) todayEl.innerText = (summary.todayProcessed ?? 0).toLocaleString();
+            if (totalEl) totalEl.innerText = (summary.totalProcessed ?? 0).toLocaleString();
+        }
+
+        async function loadExtensions() {
+            const res = await fetch('/op-panel/api/extensions');
+            const extensions = await res.json();
+            document.getElementById('ext-count').innerText = extensions.length;
+            const grid = document.getElementById('extension-grid');
+            grid.innerHTML = '';
+
+            extensions.forEach(ext => {
+                const card = document.createElement('div');
+                card.id = `card-${ext.extension}`;
+                card.className = "bg-white dark:bg-[#131c31] border border-slate-200 dark:border-slate-800 rounded-lg p-2.5 transition-all duration-150 shadow-sm dark:shadow";
+
+                card.innerHTML = `
+                    <div class="flex justify-between items-center mb-1">
+                        <span class="text-blue-600 dark:text-[#60a5fa] font-bold text-sm">#${ext.extension}</span>
+                        <div class="flex items-center gap-1">
+                            <span id="timer-${ext.extension}" class="hidden text-[10px] font-mono font-bold bg-rose-100 text-rose-700 border border-rose-300 dark:bg-rose-950 dark:text-rose-300 dark:border-rose-700/60 px-1.5 py-0.2 rounded">00:00</span>
+                            <span id="status-${ext.extension}" class="text-[10px] font-bold tracking-wider uppercase text-slate-500 dark:text-slate-400">IDLE</span>
+                        </div>
+                    </div>
+                    <div class="text-xs font-semibold text-slate-800 dark:text-white truncate mb-1" title="${ext.name || ext.extension}">
+                        ${ext.name || 'Ext ' + ext.extension}
+                    </div>
+                    <!-- Live Call Direction & Remote Party Number Badge -->
+                    <div id="callinfo-${ext.extension}" class="hidden mb-1.5 px-1.5 py-0.5 rounded text-[10px] font-mono font-bold truncate"></div>
+
+                    <div class="bg-slate-100 dark:bg-[#0b1120]/70 px-1.5 py-1 rounded border border-slate-200 dark:border-slate-800/80 mb-2 space-y-1">
+                        <div class="flex items-center justify-between gap-1">
+                            <span id="ip-${ext.extension}" class="text-[10px] font-mono text-slate-500 truncate">No IP</span>
+                            <span id="reg-${ext.extension}" class="text-[9px] font-semibold px-1.5 py-0.5 rounded bg-slate-200 text-slate-600 dark:bg-slate-800 dark:text-slate-400 shrink-0">Unregistered</span>
+                        </div>
+                        <div class="flex items-center justify-between text-[10px] border-t border-slate-200 dark:border-slate-800/70 pt-0.5">
+                            <span class="text-slate-500">Reg Time:</span>
+                            <span id="regtime-${ext.extension}" class="font-mono text-slate-500">Offline</span>
+                        </div>
+                    </div>
+                    <div class="grid grid-cols-2 gap-1.5">
+                        <button onclick="resetExt('${ext.extension}')" title="Reset hung extension to normal state"
+                                class="bg-amber-50 hover:bg-amber-500 text-amber-700 hover:text-white dark:bg-[#1e293b] dark:hover:bg-amber-600 dark:text-amber-300 dark:hover:text-white text-[11px] font-semibold py-1 rounded border border-amber-300 dark:border-slate-700 transition">
+                            Reset
+                        </button>
+                        <button id="hangup-${ext.extension}" onclick="hangupExt('${ext.extension}')"
+                                class="opacity-40 pointer-events-none bg-rose-50 hover:bg-rose-600 text-rose-700 hover:text-white dark:bg-[#4c1d24] dark:hover:bg-rose-600 dark:text-rose-200 dark:hover:text-white text-[11px] font-semibold py-1 rounded border border-rose-300 dark:border-rose-900 transition">
+                            Hangup
+                        </button>
+                    </div>
+                `;
+                grid.appendChild(card);
+                if (regCache[ext.extension] !== undefined) {
+                    updateRegUI(ext.extension, regCache[ext.extension], false);
+                }
+            });
+        }
+
+        async function loadTrunks() {
+            const res = await fetch('/op-panel/api/trunks');
+            const trunks = await res.json();
+            document.getElementById('trunk-count').innerText = trunks.length;
+            const grid = document.getElementById('trunk-grid');
+            grid.innerHTML = '';
+
+            trunks.forEach(tr => {
+                const key = tr.key;
+                const techLabel = (tr.tech || 'SIP').toUpperCase();
+                const card = document.createElement('div');
+                card.id = `card-${key}`;
+                card.dataset.isTrunk = 'true';
+                card.className = "bg-white dark:bg-[#11192c] border border-slate-200 dark:border-slate-800 rounded-lg p-2.5 transition-all duration-150 shadow-sm dark:shadow";
+
+                card.innerHTML = `
+                    <div class="flex justify-between items-center mb-1">
+                        <span class="text-cyan-700 dark:text-cyan-400 font-bold text-xs truncate">${techLabel}/${key}</span>
+                        <div class="flex items-center gap-1">
+                            <span id="timer-${key}" class="hidden text-[10px] font-mono font-bold bg-rose-100 text-rose-700 border border-rose-300 dark:bg-rose-950 dark:text-rose-300 dark:border-rose-700/60 px-1.5 py-0.2 rounded">00:00</span>
+                            <span id="status-${key}" class="text-[10px] font-bold tracking-wider uppercase text-slate-500 dark:text-slate-400">IDLE</span>
+                        </div>
+                    </div>
+                    <div class="text-xs font-medium text-slate-800 dark:text-slate-200 truncate mb-1">${tr.name || key}</div>
+                    <div id="callinfo-${key}" class="hidden mb-1.5 px-1.5 py-0.5 rounded text-[10px] font-mono font-bold truncate"></div>
+                    <div class="bg-slate-100 dark:bg-[#0b1120]/70 px-1.5 py-1 rounded border border-slate-200 dark:border-slate-800/80 space-y-1">
+                        <div class="flex items-center justify-between gap-1">
+                            <span id="ip-${key}" class="text-[10px] font-mono text-slate-500 truncate">No IP</span>
+                            <span id="reg-${key}" class="text-[9px] font-semibold px-1.5 py-0.5 rounded bg-rose-100 text-rose-700 dark:bg-rose-950/70 dark:text-rose-300 shrink-0">Trunk Un-Registered</span>
+                        </div>
+                        <div class="flex items-center justify-between text-[10px] border-t border-slate-200 dark:border-slate-800/70 pt-0.5">
+                            <span class="text-slate-500">Reg Time:</span>
+                            <span id="regtime-${key}" class="font-mono text-slate-500">Offline</span>
+                        </div>
+                    </div>
+                `;
+                grid.appendChild(card);
+                if (regCache[key] !== undefined) {
+                    updateRegUI(key, regCache[key], true);
+                }
+            });
+        }
+
+        function updateRegUI(peer, info, forceTrunk = null) {
+            if (!info) return;
+            regCache[peer] = info;
+            const badge = document.getElementById(`reg-${peer}`);
+            const ipEl = document.getElementById(`ip-${peer}`);
+            const regTimeEl = document.getElementById(`regtime-${peer}`);
+            const card = document.getElementById(`card-${peer}`);
+            if (!badge || !card) return;
+
+            const isTrunk = forceTrunk !== null ? forceTrunk : (card.dataset.isTrunk === 'true');
+            const isRegistered = !!info.registered;
+            const ip = info.ip || '';
+            const regSince = info.regSince || null;
+
+            if (ipEl) {
+                if (isRegistered && ip) {
+                    ipEl.innerText = ip;
+                    ipEl.className = 'text-[10px] font-mono font-semibold text-emerald-700 dark:text-emerald-300 truncate';
+                } else {
+                    ipEl.innerText = 'No IP';
+                    ipEl.className = 'text-[10px] font-mono text-slate-500 truncate';
+                }
+            }
+
+            if (regTimeEl) {
+                if (isRegistered && regSince) {
+                    regTimers[peer] = regSince;
+                    regTimeEl.innerText = `Up ${formatRegUptime(Date.now() - regSince)}`;
+                    regTimeEl.className = 'font-mono font-semibold text-sky-700 dark:text-sky-300';
+                } else {
+                    delete regTimers[peer];
+                    regTimeEl.innerText = 'Offline';
+                    regTimeEl.className = 'font-mono text-slate-500';
+                }
+            }
+
+            if (isTrunk) {
+                if (isRegistered) {
+                    badge.innerText = 'Trunk Registered';
+                    badge.className = 'text-[9px] font-semibold px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-800 border border-emerald-300 dark:bg-emerald-950/90 dark:text-emerald-300 dark:border-emerald-700/70 shrink-0';
+                } else {
+                    badge.innerText = 'Trunk Un-Registered';
+                    badge.className = 'text-[9px] font-semibold px-1.5 py-0.5 rounded bg-rose-100 text-rose-700 border border-rose-300 dark:bg-rose-950/70 dark:text-rose-300 dark:border-rose-800/60 shrink-0';
+                }
+            } else {
+                if (isRegistered) {
+                    badge.innerText = 'Registered';
+                    badge.className = 'text-[9px] font-semibold px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-800 border border-emerald-300 dark:bg-emerald-950/90 dark:text-emerald-300 dark:border-emerald-700/70 shrink-0';
+                } else {
+                    badge.innerText = 'Unregistered';
+                    badge.className = 'text-[9px] font-semibold px-1.5 py-0.5 rounded bg-slate-200 text-slate-600 dark:bg-slate-800 dark:text-slate-400 shrink-0';
+                }
+            }
+        }
+
+        function updateCardUI(peer, status, startTime = null, callInfo = null) {
+            const card = document.getElementById(`card-${peer}`);
+            const statusText = document.getElementById(`status-${peer}`);
+            const timerEl = document.getElementById(`timer-${peer}`);
+            const hangupBtn = document.getElementById(`hangup-${peer}`);
+            const callInfoEl = document.getElementById(`callinfo-${peer}`);
+            if (!card) return;
+
+            statusText.innerText = status;
+            card.classList.remove(
+                'border-slate-200', 'dark:border-slate-800',
+                'border-rose-500', 'bg-rose-50', 'dark:bg-[#1f1627]',
+                'border-amber-500', 'bg-amber-50', 'dark:bg-[#211d18]'
+            );
+            statusText.classList.remove(
+                'text-slate-500', 'dark:text-slate-400',
+                'text-rose-600', 'dark:text-rose-400',
+                'text-amber-600', 'dark:text-amber-400'
+            );
+
+            // Render Incoming / Outgoing remote number badge
+            if (callInfoEl) {
+                if ((status === 'INCALL' || status === 'RINGING') && callInfo && callInfo.number) {
+                    const dirLabel = callInfo.dir === 'OUT' ? 'OUT' : 'IN';
+                    callInfoEl.innerText = `${dirLabel}: ${callInfo.number}`;
+                    callInfoEl.title = `${dirLabel === 'OUT' ? 'Outgoing to' : 'Incoming from'} ${callInfo.number}`;
+                    callInfoEl.classList.remove('hidden');
+                    if (dirLabel === 'OUT') {
+                        callInfoEl.className = 'mb-1.5 px-1.5 py-0.5 rounded text-[10px] font-mono font-bold truncate bg-amber-100 text-amber-800 border border-amber-300 dark:bg-amber-950/80 dark:text-amber-300 dark:border-amber-700/70';
+                    } else {
+                        callInfoEl.className = 'mb-1.5 px-1.5 py-0.5 rounded text-[10px] font-mono font-bold truncate bg-emerald-100 text-emerald-800 border border-emerald-300 dark:bg-emerald-950/80 dark:text-emerald-300 dark:border-emerald-700/70';
+                    }
+                } else {
+                    callInfoEl.classList.add('hidden');
+                    callInfoEl.innerText = '';
+                }
+            }
+
+            if (status === 'INCALL') {
+                card.classList.add('border-rose-500', 'bg-rose-50', 'dark:bg-[#1f1627]');
+                statusText.classList.add('text-rose-600', 'dark:text-rose-400');
+                if (hangupBtn) hangupBtn.classList.remove('opacity-40', 'pointer-events-none');
+                if (timerEl) {
+                    activeTimers[peer] = startTime || activeTimers[peer] || Date.now();
+                    timerEl.innerText = formatCallDuration(Date.now() - activeTimers[peer]);
+                    timerEl.classList.remove('hidden');
+                }
+            } else if (status === 'RINGING') {
+                card.classList.add('border-amber-500', 'bg-amber-50', 'dark:bg-[#211d18]');
+                statusText.classList.add('text-amber-600', 'dark:text-amber-400');
+                if (hangupBtn) hangupBtn.classList.remove('opacity-40', 'pointer-events-none');
+                if (timerEl) {
+                    delete activeTimers[peer];
+                    timerEl.classList.add('hidden');
+                }
+            } else {
+                card.classList.add('border-slate-200', 'dark:border-slate-800');
+                statusText.classList.add('text-slate-500', 'dark:text-slate-400');
+                if (hangupBtn) hangupBtn.classList.add('opacity-40', 'pointer-events-none');
+                if (timerEl) {
+                    delete activeTimers[peer];
+                    timerEl.classList.add('hidden');
+                    timerEl.innerText = '00:00';
+                }
+            }
+        }
+
+        // Socket.io Event Listeners
+        socket.on('initial_state', ({ statuses, startTimes, callDetails, registrations, callSummary }) => {
+            if (callSummary) updateCallSummaryUI(callSummary);
+            if (registrations) {
+                Object.keys(registrations).forEach(peer => updateRegUI(peer, registrations[peer]));
+            }
+            if (statuses) {
+                Object.keys(statuses).forEach(peer => {
+                    updateCardUI(
+                        peer,
+                        statuses[peer],
+                        startTimes ? startTimes[peer] : null,
+                        callDetails ? callDetails[peer] : null
+                    );
+                });
+            }
+        });
+
+        socket.on('reg_status', ({ peer, registered, ip, regSince }) => {
+            updateRegUI(peer, { registered, ip, regSince });
+        });
+
+        socket.on('ext_status', ({ exten, status, startTime, callInfo, callSummary }) => {
+            updateCardUI(exten, status, startTime, callInfo);
+            if (callSummary) updateCallSummaryUI(callSummary);
+        });
+
+        socket.on('call_summary', (summary) => {
+            updateCallSummaryUI(summary);
+        });
+
+        socket.on('system_stats', (stats) => {
+            if (!stats) return;
+            document.getElementById('sys-cpu-val').innerText = `${stats.cpuPercent}%`;
+            document.getElementById('sys-cpu-cores').innerText = `${stats.cpuCores} Cores`;
+            document.getElementById('sys-ram-pct').innerText = `${stats.ramPercent}%`;
+            document.getElementById('sys-ram-val').innerText = `${stats.usedMemGB} / ${stats.totalMemGB} GB`;
+            document.getElementById('sys-disk-val').innerText = `Used: ${stats.diskUsed} | Free: ${stats.diskFree} (${stats.diskPercent})`;
+            document.getElementById('sys-local-ip').innerText = stats.serverIp || '---';
+            document.getElementById('sys-public-ip').innerText = stats.publicIp || '---';
+            document.getElementById('sys-location').innerText = stats.location || '---';
+        });
+
+        function resetExt(targetExten) {
+            socket.emit('action_reset', { exten: targetExten });
+            updateCardUI(targetExten, 'IDLE', null, null);
+        }
+
+        function hangupExt(targetExten) {
+            socket.emit('action_hangup', { exten: targetExten });
+        }
+
+        async function initPanel() {
+            await Promise.all([loadExtensions(), loadTrunks()]);
+            Object.keys(regCache).forEach(peer => updateRegUI(peer, regCache[peer]));
+        }
+
+        initPanel();
+    </script>
+</body>
+</html>
