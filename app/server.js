@@ -14,19 +14,27 @@ const io = new Server(server, {
     cors: { origin: '*' }
 });
 
-const dbConfig = {
+const dbPool = mysql.createPool({
     host: 'localhost',
     user: 'root',
     password: "MYSQL_PASSWORD_PLACEHOLDER",
-    database: 'asterisk'
-};
+    database: 'asterisk',
+    waitForConnections: true,
+    connectionLimit: 3,
+    queueLimit: 20,
+    connectTimeout: 5000
+});
 
-const cdrDbConfig = {
+const cdrDbPool = mysql.createPool({
     host: 'localhost',
     user: 'root',
     password: "MYSQL_PASSWORD_PLACEHOLDER",
-    database: 'asteriskcdrdb'
-};
+    database: 'asteriskcdrdb',
+    waitForConnections: true,
+    connectionLimit: 2,
+    queueLimit: 20,
+    connectTimeout: 5000
+});
 
 const ami = new AsteriskManager(5038, "127.0.0.1", "admin", "AMI_PASSWORD_PLACEHOLDER", true);
 ami.keepConnected();
@@ -41,6 +49,10 @@ const channelMap = {};        // { uniqueid: { uniqueid, peer, channel, callerNu
 const knownTrunks = new Set();
 const trunkCanonicalMap = {};
 const knownExtensions = new Set();
+
+// Cached extensions & trunks list for resilience when DB is busy
+let cachedExtensionsList = [];
+let cachedTrunksList = [];
 
 // Cached CDR call counts (overall + per-extension today)
 let cachedCdrStats = {
@@ -95,13 +107,18 @@ function isOutgoingContext(context = '', channel = '') {
     );
 }
 
-// Refresh known extensions & trunks sets from MySQL
+// Refresh known extensions & trunks sets from MySQL pool
 async function refreshPeerRegistry() {
     try {
-        const conn = await mysql.createConnection(dbConfig);
-        const [extRows] = await conn.execute('SELECT extension FROM users');
-        const [trunkRows] = await conn.execute('SELECT name, channelid FROM trunks WHERE disabled = "off"');
-        await conn.end();
+        const [extRows] = await dbPool.execute('SELECT extension, name FROM users ORDER BY CAST(extension AS UNSIGNED) ASC');
+        const [trunkRows] = await dbPool.execute('SELECT trunkid, name, tech, channelid FROM trunks WHERE disabled = "off" ORDER BY trunkid ASC');
+
+        cachedExtensionsList = extRows;
+        cachedTrunksList = trunkRows.map(r => ({
+            key: r.channelid || r.name,
+            name: r.name,
+            tech: r.tech
+        }));
 
         knownExtensions.clear();
         extRows.forEach(r => {
@@ -122,11 +139,13 @@ async function refreshPeerRegistry() {
             }
         });
     } catch (err) {
-        console.error('Error refreshing peer registry:', err.message);
+        if (!String(err.message || '').includes('Too many connections')) {
+            console.error('Error refreshing peer registry:', err.message);
+        }
     }
 }
 refreshPeerRegistry();
-setInterval(refreshPeerRegistry, 30000);
+setInterval(refreshPeerRegistry, 60000);
 
 function isTrunkPeer(peer) {
     if (!peer) return false;
@@ -285,23 +304,21 @@ function removeTrunkCall(trunkPeer, uid, linkedid = '') {
     syncTrunkFromMap(trunkPeer);
 }
 
-// Fetch Today's Processed Calls, Total Processed Calls & Per-Extension Daily Calls from asteriskcdrdb.cdr
+// Fetch Today's Processed Calls, Total Processed Calls & Per-Extension Daily Calls from asteriskcdrdb.cdr pool
 async function refreshCdrStats() {
     try {
-        const conn = await mysql.createConnection(cdrDbConfig);
-        const [rows] = await conn.execute(`
+        const [rows] = await cdrDbPool.execute(`
             SELECT 
                 COUNT(DISTINCT uniqueid) AS total_calls,
                 COUNT(DISTINCT CASE WHEN DATE(calldate) = CURDATE() THEN uniqueid END) AS today_calls
             FROM cdr
         `);
 
-        const [todayRows] = await conn.execute(`
+        const [todayRows] = await cdrDbPool.execute(`
             SELECT uniqueid, src, dst, channel, dstchannel
             FROM cdr
             WHERE DATE(calldate) = CURDATE()
         `);
-        await conn.end();
 
         const extCallSets = {};
         todayRows.forEach(r => {
@@ -340,11 +357,13 @@ async function refreshCdrStats() {
             io.emit('call_summary', getCallSummary());
         }
     } catch (err) {
-        console.error('Error fetching CDR call stats:', err.message);
+        if (!String(err.message || '').includes('Too many connections')) {
+            console.error('Error fetching CDR call stats:', err.message);
+        }
     }
 }
-setTimeout(refreshCdrStats, 800);
-setInterval(refreshCdrStats, 5000);
+setTimeout(refreshCdrStats, 2000);
+setInterval(refreshCdrStats, 20000);
 
 // Fetch Public IP and Location metadata periodically (IPv4 forced with fast timeout)
 function refreshPublicIpAndLocation() {
@@ -608,7 +627,6 @@ function syncActiveChannels() {
             });
         });
 
-        // Map bridgeId -> outgoing extension & dialed number from macro-dialout-trunk legs
         const bridgeOutInfo = {};
         parsedRows.forEach(r => {
             const p = extractPeer(r.channel);
@@ -744,13 +762,12 @@ function syncActiveChannels() {
     });
 }
 
-setInterval(pollRegistrations, 5000);
-setInterval(syncActiveChannels, 4000);
+setInterval(pollRegistrations, 6000);
+setInterval(syncActiveChannels, 5000);
 setTimeout(() => {
     pollRegistrations();
     syncActiveChannels();
     broadcastSystemStats();
-    refreshCdrStats();
 }, 1500);
 
 // Listen to Asterisk AMI Real-Time Events
@@ -842,7 +859,6 @@ ami.on('managerevent', (evt) => {
         const linked = getCorrelatedChannels(linkedid);
         const hasIncomingTrunk = linked.some(c => c.isTrunk && !isOutgoingContext(c.context, c.channel) && (c.context.includes('from-trunk') || c.context.includes('from-pstn') || c.context.includes('from-did')));
 
-        // Case A: Extension dialing out to a Trunk
         if (srcPeer && !isTrunkPeer(srcPeer) && destPeer && isTrunkPeer(destPeer)) {
             const rawTarget = extractDialedNumberFromData(evt.dialstring)
                 || (isValidNumber(evt.destcalleridnum, srcPeer) ? evt.destcalleridnum : '')
@@ -869,7 +885,6 @@ ami.on('managerevent', (evt) => {
             return;
         }
 
-        // Case B: Source leg is an Extension
         if (srcPeer && !isTrunkPeer(srcPeer)) {
             if (hasIncomingTrunk) {
                 const extCaller = resolveLinkedNumber(linkedid, srcPeer, false) || (isValidNumber(srcCaller, srcPeer) ? srcCaller : '');
@@ -891,7 +906,6 @@ ami.on('managerevent', (evt) => {
             }
         }
 
-        // Case C: Destination leg is a Trunk or Extension
         if (destPeer) {
             if (isTrunkPeer(destPeer)) {
                 const srcIsExt = srcPeer && !isTrunkPeer(srcPeer);
@@ -1054,7 +1068,7 @@ ami.on('managerevent', (evt) => {
                 refreshTrunksForExtension(peer);
             }
         }
-        setTimeout(refreshCdrStats, 1000);
+        setTimeout(refreshCdrStats, 2500);
     }
 
     if (eventName === 'PeerStatus') {
@@ -1070,34 +1084,36 @@ ami.on('managerevent', (evt) => {
     }
 });
 
-// REST API: Fetch extensions from MySQL
+// REST API: Fetch extensions from MySQL pool (with cached fallback if DB busy)
 app.get('/api/extensions', async (req, res) => {
     try {
-        const conn = await mysql.createConnection(dbConfig);
-        const [rows] = await conn.execute('SELECT extension, name FROM users ORDER BY CAST(extension AS UNSIGNED) ASC');
-        await conn.end();
+        const [rows] = await dbPool.execute('SELECT extension, name FROM users ORDER BY CAST(extension AS UNSIGNED) ASC');
+        cachedExtensionsList = rows;
         res.json(rows);
     } catch (err) {
-        console.error('Error fetching extensions:', err);
-        res.status(500).json({ error: err.message });
+        if (cachedExtensionsList.length > 0) {
+            return res.json(cachedExtensionsList);
+        }
+        res.json([]);
     }
 });
 
-// REST API: Fetch trunks from MySQL
+// REST API: Fetch trunks from MySQL pool (with cached fallback if DB busy)
 app.get('/api/trunks', async (req, res) => {
     try {
-        const conn = await mysql.createConnection(dbConfig);
-        const [rows] = await conn.execute('SELECT trunkid, name, tech, channelid FROM trunks WHERE disabled = "off" ORDER BY trunkid ASC');
-        await conn.end();
+        const [rows] = await dbPool.execute('SELECT trunkid, name, tech, channelid FROM trunks WHERE disabled = "off" ORDER BY trunkid ASC');
         const formatted = rows.map(r => ({
             key: r.channelid || r.name,
             name: r.name,
             tech: r.tech
         }));
+        cachedTrunksList = formatted;
         res.json(formatted);
     } catch (err) {
-        console.error('Error fetching trunks:', err);
-        res.status(500).json({ error: err.message });
+        if (cachedTrunksList.length > 0) {
+            return res.json(cachedTrunksList);
+        }
+        res.json([]);
     }
 });
 
@@ -1112,7 +1128,6 @@ io.on('connection', (socket) => {
     });
     broadcastSystemStats();
 
-    // Reset hung extension state
     socket.on('action_reset', ({ exten }) => {
         if (!exten) return;
         peerStatuses[exten] = 'IDLE';
@@ -1125,7 +1140,6 @@ io.on('connection', (socket) => {
         refreshTrunksForExtension(exten);
     });
 
-    // Hangup active call on target extension
     socket.on('action_hangup', ({ exten }) => {
         if (!exten) return;
         ami.action({ action: 'Command', command: 'core show channels concise' }, (err, res) => {
