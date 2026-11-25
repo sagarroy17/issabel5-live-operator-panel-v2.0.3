@@ -14,6 +14,7 @@ const io = new Server(server, {
     cors: { origin: '*' }
 });
 
+// MySQL Connection Pools (kept small & queued to avoid "Too many connections" on busy servers)
 const dbPool = mysql.createPool({
     host: 'localhost',
     user: 'root',
@@ -113,22 +114,22 @@ async function refreshPeerRegistry() {
         const [extRows] = await dbPool.execute('SELECT extension, name FROM users ORDER BY CAST(extension AS UNSIGNED) ASC');
         const [trunkRows] = await dbPool.execute('SELECT trunkid, name, tech, channelid FROM trunks WHERE disabled = "off" ORDER BY trunkid ASC');
 
-        cachedExtensionsList = extRows;
-        cachedTrunksList = trunkRows.map(r => ({
+        cachedExtensionsList = Array.isArray(extRows) ? extRows : [];
+        cachedTrunksList = Array.isArray(trunkRows) ? trunkRows.map(r => ({
             key: r.channelid || r.name,
             name: r.name,
             tech: r.tech
-        }));
+        })) : [];
 
         knownExtensions.clear();
-        extRows.forEach(r => {
+        cachedExtensionsList.forEach(r => {
             if (r.extension) knownExtensions.add(String(r.extension).trim());
         });
 
         knownTrunks.clear();
         Object.keys(trunkCanonicalMap).forEach(k => delete trunkCanonicalMap[k]);
-        trunkRows.forEach(r => {
-            const key = (r.channelid || r.name || '').trim();
+        cachedTrunksList.forEach(r => {
+            const key = (r.key || r.name || '').trim();
             if (key) {
                 knownTrunks.add(key);
                 trunkCanonicalMap[key.toLowerCase()] = key;
@@ -321,27 +322,29 @@ async function refreshCdrStats() {
         `);
 
         const extCallSets = {};
-        todayRows.forEach(r => {
-            const uid = r.uniqueid;
-            const matchedExts = new Set();
+        if (Array.isArray(todayRows)) {
+            todayRows.forEach(r => {
+                const uid = r.uniqueid;
+                const matchedExts = new Set();
 
-            const src = String(r.src || '').trim();
-            const dst = String(r.dst || '').trim();
-            if (knownExtensions.has(src)) matchedExts.add(src);
-            if (knownExtensions.has(dst)) matchedExts.add(dst);
+                const src = String(r.src || '').trim();
+                const dst = String(r.dst || '').trim();
+                if (knownExtensions.has(src)) matchedExts.add(src);
+                if (knownExtensions.has(dst)) matchedExts.add(dst);
 
-            [r.channel, r.dstchannel].forEach(ch => {
-                const p = extractPeer(ch);
-                if (p && knownExtensions.has(p)) {
-                    matchedExts.add(p);
-                }
+                [r.channel, r.dstchannel].forEach(ch => {
+                    const p = extractPeer(ch);
+                    if (p && knownExtensions.has(p)) {
+                        matchedExts.add(p);
+                    }
+                });
+
+                matchedExts.forEach(ext => {
+                    if (!extCallSets[ext]) extCallSets[ext] = new Set();
+                    extCallSets[ext].add(uid);
+                });
             });
-
-            matchedExts.forEach(ext => {
-                if (!extCallSets[ext]) extCallSets[ext] = new Set();
-                extCallSets[ext].add(uid);
-            });
-        });
+        }
 
         const extDailyCalls = {};
         Object.keys(extCallSets).forEach(ext => {
@@ -1088,8 +1091,8 @@ ami.on('managerevent', (evt) => {
 app.get('/api/extensions', async (req, res) => {
     try {
         const [rows] = await dbPool.execute('SELECT extension, name FROM users ORDER BY CAST(extension AS UNSIGNED) ASC');
-        cachedExtensionsList = rows;
-        res.json(rows);
+        cachedExtensionsList = Array.isArray(rows) ? rows : [];
+        res.json(cachedExtensionsList);
     } catch (err) {
         if (cachedExtensionsList.length > 0) {
             return res.json(cachedExtensionsList);
@@ -1102,11 +1105,11 @@ app.get('/api/extensions', async (req, res) => {
 app.get('/api/trunks', async (req, res) => {
     try {
         const [rows] = await dbPool.execute('SELECT trunkid, name, tech, channelid FROM trunks WHERE disabled = "off" ORDER BY trunkid ASC');
-        const formatted = rows.map(r => ({
+        const formatted = Array.isArray(rows) ? rows.map(r => ({
             key: r.channelid || r.name,
             name: r.name,
             tech: r.tech
-        }));
+        })) : [];
         cachedTrunksList = formatted;
         res.json(formatted);
     } catch (err) {
@@ -1128,27 +1131,50 @@ io.on('connection', (socket) => {
     });
     broadcastSystemStats();
 
+    // Reset & clear hung call/session ONLY for the targeted extension
     socket.on('action_reset', ({ exten }) => {
-        if (!exten) return;
-        peerStatuses[exten] = 'IDLE';
-        delete callStartTimes[exten];
-        delete callDetails[exten];
+        const targetExt = String(exten || '').trim();
+        if (!targetExt) return;
+
+        peerStatuses[targetExt] = 'IDLE';
+        delete callStartTimes[targetExt];
+        delete callDetails[targetExt];
+
         Object.keys(channelMap).forEach(uid => {
-            if (channelMap[uid].peer === exten) delete channelMap[uid];
+            if (channelMap[uid] && channelMap[uid].peer === targetExt) {
+                delete channelMap[uid];
+            }
         });
-        emitPeerUpdate(exten);
-        refreshTrunksForExtension(exten);
+
+        ami.action({ action: 'Command', command: 'core show channels concise' }, (err, res) => {
+            if (!err && res) {
+                const output = normalizeAmiOut(res);
+                output.split('\n').forEach(line => {
+                    if (!line.includes('!')) return;
+                    const channel = line.split('!')[0];
+                    if (extractPeer(channel) === targetExt) {
+                        ami.action({ action: 'Hangup', channel: channel });
+                    }
+                });
+            }
+        });
+
+        emitPeerUpdate(targetExt);
+        refreshTrunksForExtension(targetExt);
+        io.emit('call_summary', getCallSummary());
     });
 
     socket.on('action_hangup', ({ exten }) => {
-        if (!exten) return;
+        const targetExt = String(exten || '').trim();
+        if (!targetExt) return;
+
         ami.action({ action: 'Command', command: 'core show channels concise' }, (err, res) => {
             if (err || !res) return;
             const output = normalizeAmiOut(res);
             output.split('\n').forEach(line => {
                 if (!line.includes('!')) return;
                 const channel = line.split('!')[0];
-                if (extractPeer(channel) === exten) {
+                if (extractPeer(channel) === targetExt) {
                     ami.action({ action: 'Hangup', channel: channel });
                 }
             });
