@@ -254,7 +254,6 @@
                 }
             });
 
-            // Live tick on multi-call trunk items
             Object.keys(cardStateCache).forEach(peer => {
                 const cached = cardStateCache[peer];
                 if (cached && cached.isTrunk && cached.callInfo && Array.isArray(cached.callInfo.calls) && cached.callInfo.calls.length > 0) {
@@ -298,7 +297,6 @@
             } else if (callStatus === 'RINGING') {
                 card.classList.add('border-amber-500', 'bg-amber-50', 'dark:bg-[#211d18]');
             } else if (!isTrunk && isRegistered) {
-                // Highlight registered extensions clearly in emerald
                 card.classList.add('border-emerald-400', 'dark:border-emerald-500/70', 'ring-1', 'ring-emerald-400/30', 'dark:ring-emerald-500/20');
             } else {
                 card.classList.add('border-slate-200', 'dark:border-slate-800');
@@ -330,7 +328,6 @@
                     <div class="text-xs font-semibold text-slate-800 dark:text-white truncate mb-1" title="${ext.name || ext.extension}">
                         ${ext.name || 'Ext ' + ext.extension}
                     </div>
-                    <!-- Live Call Direction & Remote Party Number Badge -->
                     <div id="callinfo-${ext.extension}" class="hidden mb-1.5 px-1.5 py-0.5 rounded text-[10px] font-mono font-bold truncate"></div>
 
                     <div class="bg-slate-100 dark:bg-[#0b1120]/70 px-1.5 py-1 rounded border border-slate-200 dark:border-slate-800/80 mb-2 space-y-1">
@@ -389,7 +386,6 @@
                         </div>
                     </div>
                     <div class="text-xs font-medium text-slate-800 dark:text-slate-200 truncate mb-1">${tr.name || key}</div>
-                    <!-- Multi-call list on Trunk with linked extension badge -->
                     <div id="trunkcalls-${key}" class="hidden mb-1.5 space-y-1 max-h-32 overflow-y-auto"></div>
                     <div id="callinfo-${key}" class="hidden mb-1.5 px-1.5 py-0.5 rounded text-[10px] font-mono font-bold truncate"></div>
                     <div class="bg-slate-100 dark:bg-[#0b1120]/70 px-1.5 py-1 rounded border border-slate-200 dark:border-slate-800/80 space-y-1">
@@ -496,7 +492,6 @@
                 'text-amber-600', 'dark:text-amber-400'
             );
 
-            // Render multi-call list on Trunk or single badge on Extension
             if (isTrunk && trunkCallsEl) {
                 if ((status === 'INCALL' || status === 'RINGING') && callInfo && Array.isArray(callInfo.calls) && callInfo.calls.length > 0) {
                     const now = Date.now();
