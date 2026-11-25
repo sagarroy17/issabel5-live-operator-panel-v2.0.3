@@ -34,10 +34,10 @@ ami.keepConnected();
 // In-memory state stores
 const peerStatuses = {};      // { peer: 'IDLE' | 'RINGING' | 'INCALL' }
 const callStartTimes = {};    // { peer: timestamp_ms }
-const callDetails = {};       // { peer: { dir: 'IN' | 'OUT', number: '017...', linkedExten: '524' } }
-const trunkActiveCalls = {};  // { trunkPeer: { [callKey]: { callKey, uniqueid, linkedid, dir, number, exten, status, startTime } } }
+const callDetails = {};       // { peer: { dir: 'IN' | 'OUT', number: '017...', exten: '524', linkedid: '', bridgeid: '', calls: [] } }
+const trunkActiveCalls = {};  // { trunkPeer: { [callKey]: { callKey, uniqueid, linkedid, bridgeid, dir, number, exten, status, startTime } } }
 const regStatus = {};         // { peer: { registered: bool, ip: string, regSince: timestamp_ms } }
-const channelMap = {};        // { uniqueid: { uniqueid, peer, channel, callerNum, exten, direction, linkedid, bridgeid, context, isTrunk, state } }
+const channelMap = {};        // { uniqueid: { uniqueid, peer, channel, callerNum, exten, linkedid, bridgeid, context, isTrunk, state } }
 const knownTrunks = new Set();
 const trunkCanonicalMap = {};
 const knownExtensions = new Set();
@@ -149,7 +149,6 @@ function findLinkedExtension(linkedid, bridgeid = '', excludeExt = null) {
             return leg.peer;
         }
     }
-    // Also check if an extension currently holds callDetails with matching linkedid/bridgeid
     for (const [p, det] of Object.entries(callDetails)) {
         if (!isTrunkPeer(p) && isExtensionPeer(p) && p !== excludeExt && det) {
             if ((linkedid && det.linkedid === linkedid) || (bridgeid && det.bridgeid === bridgeid)) {
@@ -188,9 +187,8 @@ function syncTrunkFromMap(trunkPeer) {
     const map = trunkActiveCalls[trunkPeer] || {};
     const callsList = Object.values(map).sort((a, b) => (a.startTime || 0) - (b.startTime || 0));
 
-    // Refresh linkedExten on every active trunk call
     callsList.forEach(c => {
-        const linkedExt = findLinkedExtension(c.linkedid, c.bridgeid);
+        const linkedExt = findLinkedExtension(c.linkedid, c.bridgeid || '');
         if (linkedExt) c.exten = linkedExt;
     });
 
@@ -205,7 +203,6 @@ function syncTrunkFromMap(trunkPeer) {
     const hasInCall = callsList.some(c => c.status === 'INCALL');
     peerStatuses[trunkPeer] = hasInCall ? 'INCALL' : 'RINGING';
 
-    // Earliest call start time for trunk badge timer, plus full calls array for multi-call display
     const earliestStart = callsList.reduce((min, c) => (!min || (c.startTime && c.startTime < min)) ? c.startTime : min, null);
     if (earliestStart) {
         callStartTimes[trunkPeer] = earliestStart;
@@ -629,7 +626,7 @@ function syncActiveChannels() {
                                     dir: isOut ? 'OUT' : 'IN',
                                     number: remote,
                                     linkedid: (channelMap[uniqueid] && channelMap[uniqueid].linkedid) || uniqueid,
-                                    bridgeid
+                                    bridgeid: bridgeId
                                 };
                             }
                         }
@@ -645,7 +642,6 @@ function syncActiveChannels() {
             }
         });
 
-        // Clean up stale trunk calls that are no longer active
         Object.keys(trunkActiveCalls).forEach(trPeer => {
             const validSet = seenTrunkCallKeysByPeer[trPeer] || new Set();
             let changed = false;
