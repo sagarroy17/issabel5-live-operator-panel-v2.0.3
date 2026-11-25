@@ -196,6 +196,7 @@
         const activeTimers = {};
         const regTimers = {};
         const regCache = {};
+        let extDailyCallsCache = {};
 
         function formatCallDuration(ms) {
             const totalSec = Math.max(0, Math.floor(ms / 1000));
@@ -236,7 +237,7 @@
             });
         }, 1000);
 
-        // Update top header call counters (Active Calls, Today's Processed Calls, Total Processed Calls)
+        // Update top header call counters + per-extension daily call counts
         function updateCallSummaryUI(summary) {
             if (!summary) return;
             const activeEl = document.getElementById('stat-total-calls');
@@ -245,6 +246,14 @@
             if (activeEl) activeEl.innerText = (summary.totalActive ?? 0).toLocaleString();
             if (todayEl) todayEl.innerText = (summary.todayProcessed ?? 0).toLocaleString();
             if (totalEl) totalEl.innerText = (summary.totalProcessed ?? 0).toLocaleString();
+
+            if (summary.extDailyCalls) {
+                extDailyCallsCache = summary.extDailyCalls;
+                document.querySelectorAll('[id^="dailycalls-"]').forEach(el => {
+                    const extId = el.id.replace('dailycalls-', '');
+                    el.innerText = (extDailyCallsCache[extId] ?? 0).toLocaleString();
+                });
+            }
         }
 
         async function loadExtensions() {
@@ -258,6 +267,7 @@
                 const card = document.createElement('div');
                 card.id = `card-${ext.extension}`;
                 card.className = "bg-white dark:bg-[#131c31] border border-slate-200 dark:border-slate-800 rounded-lg p-2.5 transition-all duration-150 shadow-sm dark:shadow";
+                const initialDailyCount = extDailyCallsCache[ext.extension] ?? 0;
 
                 card.innerHTML = `
                     <div class="flex justify-between items-center mb-1">
@@ -281,6 +291,10 @@
                         <div class="flex items-center justify-between text-[10px] border-t border-slate-200 dark:border-slate-800/70 pt-0.5">
                             <span class="text-slate-500">Reg Time:</span>
                             <span id="regtime-${ext.extension}" class="font-mono text-slate-500">Offline</span>
+                        </div>
+                        <div class="flex items-center justify-between text-[10px] border-t border-slate-200 dark:border-slate-800/70 pt-0.5">
+                            <span class="text-slate-500">No. of Calls:</span>
+                            <span id="dailycalls-${ext.extension}" class="font-mono font-bold text-slate-700 dark:text-slate-200">${initialDailyCount}</span>
                         </div>
                     </div>
                     <div class="grid grid-cols-2 gap-1.5">
