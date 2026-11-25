@@ -73,6 +73,28 @@ function isValidNumber(val, excludeSelf = null) {
     return true;
 }
 
+// Extract dialed destination number from Dial application data or dialstring (e.g. "SIP/BOL/01713152687,300,T")
+function extractDialedNumberFromData(appData = '') {
+    if (!appData) return '';
+    const m = String(appData).match(/^(?:SIP|PJSIP|IAX2|DAHDI|Local)\/[^/;,]+(?:\/([^,;/]+))?/i);
+    if (m && m[1] && isValidNumber(m[1])) return m[1].trim();
+    return '';
+}
+
+// Detect outgoing contexts/channels across Issabel/FreePBX dialplans
+function isOutgoingContext(context = '', channel = '') {
+    const ctx = String(context || '').toLowerCase();
+    const ch = String(channel || '').toLowerCase();
+    return (
+        ctx.includes('dialout') ||
+        ctx.includes('outbound') ||
+        ctx.includes('from-internal') ||
+        ctx.includes('macro-dialout') ||
+        ctx.includes('sub-pincheck') ||
+        ch.includes('dialout')
+    );
+}
+
 // Refresh known extensions & trunks sets from MySQL
 async function refreshPeerRegistry() {
     try {
@@ -559,7 +581,7 @@ function pollRegistrations() {
     });
 }
 
-// Reconcile active channels to prevent stale states & ensure accurate multi-call trunk + direction state
+// Reconcile active channels to prevent stale states & handle macro-dialout-trunk + AppDial (Outgoing Line)
 function syncActiveChannels() {
     ami.action({ action: 'Command', command: 'core show channels concise' }, (err, res) => {
         if (err || !res) return;
@@ -568,19 +590,40 @@ function syncActiveChannels() {
         const activeUniqueIds = new Set();
         const seenTrunkCallKeysByPeer = {};
 
+        const parsedRows = [];
         output.split('\n').forEach(line => {
             if (!line.includes('!')) return;
             const parts = line.split('!');
-            const channel = parts[0];
-            const context = (parts[1] || '').toLowerCase();
-            const exten = parts[2] || '';
-            const state = parts[4];
-            const callerNum = parts[7];
-            const uniqueid = parts[11] || channel;
-            const connectedNum = parts[12] || exten;
-            const bridgeId = parts[13] || '';
-            const peer = extractPeer(channel);
+            parsedRows.push({
+                channel: parts[0] || '',
+                context: (parts[1] || '').toLowerCase(),
+                exten: parts[2] || '',
+                state: parts[4] || '',
+                app: parts[5] || '',
+                appData: parts[6] || '',
+                callerNum: parts[7] || '',
+                uniqueid: parts[11] || parts[0] || '',
+                connectedNum: parts[12] || parts[2] || '',
+                bridgeId: parts[13] || ''
+            });
+        });
 
+        // Map bridgeId -> outgoing extension & dialed number from macro-dialout-trunk legs
+        const bridgeOutInfo = {};
+        parsedRows.forEach(r => {
+            const p = extractPeer(r.channel);
+            const dialedFromApp = extractDialedNumberFromData(r.appData);
+            if (p && !isTrunkPeer(p) && (isOutgoingContext(r.context, r.channel) || dialedFromApp)) {
+                const num = dialedFromApp || (isValidNumber(r.exten, p) ? r.exten : '');
+                if (r.bridgeId) {
+                    bridgeOutInfo[r.bridgeId] = { exten: p, number: num };
+                }
+            }
+        });
+
+        parsedRows.forEach(r => {
+            const { channel, context, exten, state, appData, callerNum, uniqueid, connectedNum, bridgeId } = r;
+            const peer = extractPeer(channel);
             activeUniqueIds.add(uniqueid);
             if (channelMap[uniqueid] && bridgeId) {
                 channelMap[uniqueid].bridgeid = bridgeId;
@@ -590,13 +633,28 @@ function syncActiveChannels() {
                 activePeers.add(peer);
                 const trunkFlag = isTrunkPeer(peer);
                 const mappedSt = state === 'Up' ? 'INCALL' : ((state === 'Ring' || state === 'Ringing') ? 'RINGING' : 'INCALL');
+                const dialedFromApp = extractDialedNumberFromData(appData);
+                const isOutAppLine = String(appData || '').toLowerCase().includes('outgoing line');
+                const outMeta = bridgeId ? bridgeOutInfo[bridgeId] : null;
+                const linkedid = (trunkActiveCalls[peer] && trunkActiveCalls[peer][uniqueid] && trunkActiveCalls[peer][uniqueid].linkedid)
+                    || ((channelMap[uniqueid] && channelMap[uniqueid].linkedid) || uniqueid);
 
                 if (trunkFlag) {
                     const existingEntry = (trunkActiveCalls[peer] && trunkActiveCalls[peer][uniqueid]) || null;
-                    const linkedid = existingEntry ? existingEntry.linkedid : ((channelMap[uniqueid] && channelMap[uniqueid].linkedid) || uniqueid);
-                    const isOut = context.includes('dialout') || context.includes('outbound') || (existingEntry && existingEntry.dir === 'OUT');
-                    const remote = isValidNumber(connectedNum, peer) ? connectedNum : (isValidNumber(callerNum, peer) ? callerNum : (existingEntry ? existingEntry.number : ''));
-                    const linkedExt = findLinkedExtension(linkedid, bridgeId) || (existingEntry ? existingEntry.exten : '');
+                    const isOut = Boolean(
+                        isOutgoingContext(context, channel) ||
+                        isOutAppLine ||
+                        outMeta ||
+                        (existingEntry && existingEntry.dir === 'OUT')
+                    );
+
+                    const remote = isOut
+                        ? ((outMeta && isValidNumber(outMeta.number, peer))
+                            ? outMeta.number
+                            : (isValidNumber(callerNum, peer) ? callerNum : (isValidNumber(exten, peer) ? exten : (existingEntry ? existingEntry.number : ''))))
+                        : (isValidNumber(callerNum, peer) ? callerNum : (isValidNumber(connectedNum, peer) ? connectedNum : (existingEntry ? existingEntry.number : '')));
+
+                    const linkedExt = (outMeta && outMeta.exten) || findLinkedExtension(linkedid, bridgeId) || (existingEntry ? existingEntry.exten : '');
 
                     if (!seenTrunkCallKeysByPeer[peer]) seenTrunkCallKeysByPeer[peer] = new Set();
                     seenTrunkCallKeysByPeer[peer].add(uniqueid);
@@ -613,30 +671,40 @@ function syncActiveChannels() {
                     });
                     emitPeerUpdate(peer);
                 } else {
-                    if (state === 'Up') {
-                        if (peerStatuses[peer] !== 'INCALL') {
+                    const isOutExt = Boolean(
+                        isOutgoingContext(context, channel) ||
+                        dialedFromApp ||
+                        (context.includes('from-internal') && isValidNumber(exten, peer))
+                    );
+
+                    if (state === 'Up' || state === 'Ring' || state === 'Ringing') {
+                        if (state === 'Up') {
                             peerStatuses[peer] = 'INCALL';
                             if (!callStartTimes[peer]) callStartTimes[peer] = Date.now();
+                        } else if (peerStatuses[peer] !== 'INCALL') {
+                            peerStatuses[peer] = 'RINGING';
                         }
-                        if (!callDetails[peer]) {
-                            const remote = isValidNumber(connectedNum, peer) ? connectedNum : (isValidNumber(callerNum, peer) ? callerNum : '');
-                            if (isValidNumber(remote, peer)) {
-                                const isOut = context.includes('dialout') || context.includes('outbound') || (context.includes('from-internal') && exten !== peer && exten !== 's');
-                                callDetails[peer] = {
-                                    dir: isOut ? 'OUT' : 'IN',
-                                    number: remote,
-                                    linkedid: (channelMap[uniqueid] && channelMap[uniqueid].linkedid) || uniqueid,
-                                    bridgeid: bridgeId
-                                };
-                            }
+
+                        const outNum = dialedFromApp || (isValidNumber(exten, peer) ? exten : ((outMeta && outMeta.number) || ''));
+                        const inNum = isValidNumber(callerNum, peer) ? callerNum : (isValidNumber(connectedNum, peer) ? connectedNum : '');
+
+                        if (isOutExt && isValidNumber(outNum, peer)) {
+                            callDetails[peer] = {
+                                dir: 'OUT',
+                                number: outNum,
+                                linkedid,
+                                bridgeid: bridgeId
+                            };
+                        } else if (!callDetails[peer] && isValidNumber(inNum, peer)) {
+                            callDetails[peer] = {
+                                dir: 'IN',
+                                number: inNum,
+                                linkedid,
+                                bridgeid: bridgeId
+                            };
                         }
                         emitPeerUpdate(peer);
                         refreshTrunksForExtension(peer);
-                    } else if (state === 'Ring' || state === 'Ringing') {
-                        if (peerStatuses[peer] !== 'INCALL') {
-                            peerStatuses[peer] = 'RINGING';
-                            emitPeerUpdate(peer);
-                        }
                     }
                 }
             }
@@ -716,18 +784,18 @@ ami.on('managerevent', (evt) => {
 
         if (peer) {
             const linked = getCorrelatedChannels(linkedid);
-            const originatingExtLeg = linked.find(c => !c.isTrunk && c.peer && (c.context.includes('from-internal') || c.context.includes('dialout')));
-            const incomingTrunkLeg = linked.find(c => c.isTrunk && (c.context.includes('from-trunk') || c.context.includes('from-pstn') || c.context.includes('from-did')));
+            const originatingExtLeg = linked.find(c => !c.isTrunk && c.peer && isOutgoingContext(c.context, c.channel));
+            const incomingTrunkLeg = linked.find(c => c.isTrunk && !isOutgoingContext(c.context, c.channel) && (c.context.includes('from-trunk') || c.context.includes('from-pstn') || c.context.includes('from-did')));
 
             if (trunkFlag) {
-                const isOut = Boolean(originatingExtLeg || context.includes('dialout') || context.includes('from-internal') || context.includes('outbound'));
+                const isOut = Boolean(originatingExtLeg || isOutgoingContext(context, evt.channel));
                 const num = isOut
                     ? ((originatingExtLeg && isValidNumber(originatingExtLeg.exten, peer))
                         ? originatingExtLeg.exten
-                        : (isValidNumber(dialedExten, peer) ? dialedExten : resolveLinkedNumber(linkedid, peer, true)))
+                        : (isValidNumber(dialedExten, peer) ? dialedExten : (isValidNumber(callerNum, peer) ? callerNum : resolveLinkedNumber(linkedid, peer, true))))
                     : (isValidNumber(callerNum, peer) ? callerNum : (isValidNumber(dialedExten, peer) ? dialedExten : resolveLinkedNumber(linkedid, peer, false)));
 
-                const linkedExt = findLinkedExtension(linkedid);
+                const linkedExt = (originatingExtLeg && originatingExtLeg.peer) || findLinkedExtension(linkedid);
                 upsertTrunkCall(peer, uid || linkedid, {
                     uniqueid: uid || linkedid,
                     linkedid,
@@ -744,6 +812,8 @@ ami.on('managerevent', (evt) => {
                     if (isValidNumber(externalCaller, peer)) {
                         callDetails[peer] = { dir: 'IN', number: externalCaller, linkedid };
                     }
+                } else if (isOutgoingContext(context, evt.channel) && isValidNumber(dialedExten, peer)) {
+                    callDetails[peer] = { dir: 'OUT', number: dialedExten, linkedid };
                 } else if (callerNum === peer && isValidNumber(dialedExten, peer)) {
                     callDetails[peer] = { dir: 'OUT', number: dialedExten, linkedid };
                 } else if (isValidNumber(callerNum, peer)) {
@@ -766,41 +836,80 @@ ami.on('managerevent', (evt) => {
         const srcPeer = extractPeer(evt.channel);
         const destPeer = extractPeer(evt.destchannel);
         const srcCaller = evt.calleridnum || '';
-        const destExten = evt.destcalleridnum || evt.dialstring || destPeer || '';
         const linkedid = evt.linkedid || evt.uniqueid;
         const destUid = evt.destuniqueid || evt.uniqueid;
+        const ctx = (evt.context || '').toLowerCase();
         const linked = getCorrelatedChannels(linkedid);
-        const incomingTrunkLeg = linked.find(c => c.isTrunk && (c.context.includes('from-trunk') || c.context.includes('from-pstn') || c.context.includes('from-did')));
+        const hasIncomingTrunk = linked.some(c => c.isTrunk && !isOutgoingContext(c.context, c.channel) && (c.context.includes('from-trunk') || c.context.includes('from-pstn') || c.context.includes('from-did')));
 
-        // 1. Source leg (Extension dialing out, or Queue/RingGroup dialing an agent)
+        // Case A: Extension dialing out to a Trunk
+        if (srcPeer && !isTrunkPeer(srcPeer) && destPeer && isTrunkPeer(destPeer)) {
+            const rawTarget = extractDialedNumberFromData(evt.dialstring)
+                || (isValidNumber(evt.destcalleridnum, srcPeer) ? evt.destcalleridnum : '')
+                || (isValidNumber(evt.exten, srcPeer) ? evt.exten : '')
+                || resolveLinkedNumber(linkedid, srcPeer, true);
+            const cleanTarget = String(rawTarget || '').replace(/^.*\/([^@]+).*$/, '$1');
+
+            if (isValidNumber(cleanTarget, srcPeer)) {
+                callDetails[srcPeer] = { dir: 'OUT', number: cleanTarget, linkedid };
+                if (peerStatuses[srcPeer] !== 'INCALL') peerStatuses[srcPeer] = 'RINGING';
+                emitPeerUpdate(srcPeer);
+            }
+
+            upsertTrunkCall(destPeer, destUid, {
+                uniqueid: destUid,
+                linkedid,
+                dir: 'OUT',
+                number: isValidNumber(cleanTarget, destPeer) ? cleanTarget : '',
+                exten: srcPeer,
+                status: 'RINGING',
+                startTime: Date.now()
+            });
+            emitPeerUpdate(destPeer);
+            return;
+        }
+
+        // Case B: Source leg is an Extension
         if (srcPeer && !isTrunkPeer(srcPeer)) {
-            if (incomingTrunkLeg) {
+            if (hasIncomingTrunk) {
                 const extCaller = resolveLinkedNumber(linkedid, srcPeer, false) || (isValidNumber(srcCaller, srcPeer) ? srcCaller : '');
                 if (isValidNumber(extCaller, srcPeer)) {
                     callDetails[srcPeer] = { dir: 'IN', number: extCaller, linkedid };
                     emitPeerUpdate(srcPeer);
                 }
             } else {
-                const rawDest = isValidNumber(evt.destcalleridnum, srcPeer) ? evt.destcalleridnum : (isValidNumber(destPeer, srcPeer) ? destPeer : resolveLinkedNumber(linkedid, srcPeer, true));
+                const rawDest = extractDialedNumberFromData(evt.dialstring)
+                    || (isValidNumber(evt.destcalleridnum, srcPeer) ? evt.destcalleridnum : '')
+                    || (isValidNumber(evt.exten, srcPeer) ? evt.exten : '')
+                    || (isValidNumber(destPeer, srcPeer) ? destPeer : resolveLinkedNumber(linkedid, srcPeer, true));
                 const cleanDest = String(rawDest || '').replace(/^.*\/([^@]+).*$/, '$1');
                 if (isValidNumber(cleanDest, srcPeer)) {
-                    callDetails[srcPeer] = { dir: 'OUT', number: cleanDest, linkedid };
+                    const dir = isOutgoingContext(ctx, evt.channel) || isExtensionPeer(srcPeer) ? 'OUT' : 'IN';
+                    callDetails[srcPeer] = { dir, number: cleanDest, linkedid };
                     emitPeerUpdate(srcPeer);
                 }
             }
         }
 
-        // 2. Destination leg (Outbound Trunk being dialed OR Extension receiving a call)
+        // Case C: Destination leg is a Trunk or Extension
         if (destPeer) {
             if (isTrunkPeer(destPeer)) {
-                const dialedNumber = (callDetails[srcPeer] && isValidNumber(callDetails[srcPeer].number, destPeer))
-                    ? callDetails[srcPeer].number
-                    : resolveLinkedNumber(linkedid, destPeer, true);
-                const extNum = (!isTrunkPeer(srcPeer) && isExtensionPeer(srcPeer)) ? srcPeer : findLinkedExtension(linkedid);
+                const srcIsExt = srcPeer && !isTrunkPeer(srcPeer);
+                const dir = (srcIsExt || isOutgoingContext(ctx, evt.channel)) ? 'OUT' : 'IN';
+                const dialedFromDialStr = extractDialedNumberFromData(evt.dialstring)
+                    || (isValidNumber(evt.exten, srcPeer) ? evt.exten : '')
+                    || (isValidNumber(evt.destcalleridnum, destPeer) ? evt.destcalleridnum : '');
+                const dialedNumber = isValidNumber(dialedFromDialStr, destPeer)
+                    ? dialedFromDialStr
+                    : ((callDetails[srcPeer] && isValidNumber(callDetails[srcPeer].number, destPeer))
+                        ? callDetails[srcPeer].number
+                        : resolveLinkedNumber(linkedid, destPeer, dir === 'OUT'));
+                const extNum = srcIsExt ? srcPeer : findLinkedExtension(linkedid);
+
                 upsertTrunkCall(destPeer, destUid, {
                     uniqueid: destUid,
                     linkedid,
-                    dir: 'OUT',
+                    dir,
                     number: isValidNumber(dialedNumber, destPeer) ? dialedNumber : '',
                     exten: extNum,
                     status: 'RINGING',
@@ -839,7 +948,8 @@ ami.on('managerevent', (evt) => {
                 const st = stateDesc === 'Up' ? 'INCALL' : 'RINGING';
                 const linkedExt = findLinkedExtension(linkedid);
                 const existingCall = trunkActiveCalls[peer] && trunkActiveCalls[peer][uid];
-                const remote = resolveLinkedNumber(linkedid, peer, existingCall && existingCall.dir === 'OUT')
+                const isOut = Boolean(existingCall && existingCall.dir === 'OUT');
+                const remote = resolveLinkedNumber(linkedid, peer, isOut)
                     || (isValidNumber(connectedNum, peer) ? connectedNum : (isValidNumber(callerNum, peer) ? callerNum : ''));
 
                 upsertTrunkCall(peer, uid, {
@@ -893,7 +1003,8 @@ ami.on('managerevent', (evt) => {
             if (isTrunkPeer(peer)) {
                 const linkedExt = findLinkedExtension(linkedid, bridgeid);
                 const existingCall = trunkActiveCalls[peer] && trunkActiveCalls[peer][uid];
-                const remote = resolveLinkedNumber(linkedid, peer, existingCall && existingCall.dir === 'OUT', bridgeid)
+                const isOut = Boolean(existingCall && existingCall.dir === 'OUT');
+                const remote = resolveLinkedNumber(linkedid, peer, isOut, bridgeid)
                     || (isValidNumber(connectedNum, peer) ? connectedNum : (isValidNumber(callerNum, peer) ? callerNum : ''));
 
                 upsertTrunkCall(peer, uid, {
