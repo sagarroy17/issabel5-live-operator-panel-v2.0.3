@@ -137,7 +137,6 @@
     </div>
 
     <script>
-        // Theme initialization and toggle logic
         function applyTheme(theme) {
             const htmlEl = document.documentElement;
             const iconEl = document.getElementById('theme-icon');
@@ -164,7 +163,6 @@
         const savedTheme = localStorage.getItem('op_panel_theme') || 'dark';
         applyTheme(savedTheme);
 
-        // Toggle visibility of bottom-right system telemetry widget
         function toggleWidgetBody() {
             const body = document.getElementById('sys-widget-body');
             const btn = document.getElementById('widget-toggle-btn');
@@ -177,7 +175,6 @@
             }
         }
 
-        // Update real-time clock every second
         function updateLiveClock() {
             const now = new Date();
             const clockEl = document.getElementById('live-clock');
@@ -196,6 +193,7 @@
         const activeTimers = {};
         const regTimers = {};
         const regCache = {};
+        const cardStateCache = {};
         let extDailyCallsCache = {};
 
         function formatCallDuration(ms) {
@@ -218,6 +216,26 @@
             return days > 0 ? `${days}d ${timeStr}` : timeStr;
         }
 
+        function renderTrunkCallItem(trPeer, c, now) {
+            const dirLabel = c.dir === 'OUT' ? 'OUT' : 'IN';
+            const numText = c.number || 'Active';
+            const extBadge = c.exten ? `<span class="px-1 py-0.2 rounded bg-sky-500/20 text-sky-300 border border-sky-500/40 text-[9px] font-bold shrink-0">#${c.exten}</span>` : '';
+            const durText = c.status === 'INCALL' && c.startTime ? formatCallDuration(now - c.startTime) : 'RING';
+            const badgeCls = dirLabel === 'OUT'
+                ? 'bg-amber-100/90 text-amber-900 border-amber-300 dark:bg-amber-950/85 dark:text-amber-200 dark:border-amber-700/70'
+                : 'bg-emerald-100/90 text-emerald-900 border-emerald-300 dark:bg-emerald-950/85 dark:text-emerald-200 dark:border-emerald-700/70';
+
+            return `
+                <div class="flex items-center justify-between gap-1 px-1.5 py-0.5 rounded border text-[10px] font-mono ${badgeCls}">
+                    <span class="font-bold truncate">${dirLabel}: ${numText}</span>
+                    <div class="flex items-center gap-1 shrink-0">
+                        ${extBadge}
+                        <span class="text-[9px] opacity-90">${durText}</span>
+                    </div>
+                </div>
+            `;
+        }
+
         setInterval(() => {
             const now = Date.now();
             Object.keys(activeTimers).forEach(peer => {
@@ -235,9 +253,19 @@
                     regTimeEl.innerText = `Up ${formatRegUptime(now - regSince)}`;
                 }
             });
+
+            // Live tick on multi-call trunk items
+            Object.keys(cardStateCache).forEach(peer => {
+                const cached = cardStateCache[peer];
+                if (cached && cached.isTrunk && cached.callInfo && Array.isArray(cached.callInfo.calls) && cached.callInfo.calls.length > 0) {
+                    const listEl = document.getElementById(`trunkcalls-${peer}`);
+                    if (listEl) {
+                        listEl.innerHTML = cached.callInfo.calls.map(c => renderTrunkCallItem(peer, c, now)).join('');
+                    }
+                }
+            });
         }, 1000);
 
-        // Update top header call counters + per-extension daily call counts
         function updateCallSummaryUI(summary) {
             if (!summary) return;
             const activeEl = document.getElementById('stat-total-calls');
@@ -256,6 +284,27 @@
             }
         }
 
+        function applyCardVisualClasses(card, isTrunk, isRegistered, callStatus) {
+            if (!card) return;
+            card.classList.remove(
+                'border-slate-200', 'dark:border-slate-800',
+                'border-emerald-400', 'dark:border-emerald-500/70', 'ring-1', 'ring-emerald-400/30', 'dark:ring-emerald-500/20',
+                'border-rose-500', 'bg-rose-50', 'dark:bg-[#1f1627]',
+                'border-amber-500', 'bg-amber-50', 'dark:bg-[#211d18]'
+            );
+
+            if (callStatus === 'INCALL') {
+                card.classList.add('border-rose-500', 'bg-rose-50', 'dark:bg-[#1f1627]');
+            } else if (callStatus === 'RINGING') {
+                card.classList.add('border-amber-500', 'bg-amber-50', 'dark:bg-[#211d18]');
+            } else if (!isTrunk && isRegistered) {
+                // Highlight registered extensions clearly in emerald
+                card.classList.add('border-emerald-400', 'dark:border-emerald-500/70', 'ring-1', 'ring-emerald-400/30', 'dark:ring-emerald-500/20');
+            } else {
+                card.classList.add('border-slate-200', 'dark:border-slate-800');
+            }
+        }
+
         async function loadExtensions() {
             const res = await fetch('/op-panel/api/extensions');
             const extensions = await res.json();
@@ -266,6 +315,7 @@
             extensions.forEach(ext => {
                 const card = document.createElement('div');
                 card.id = `card-${ext.extension}`;
+                card.dataset.isTrunk = 'false';
                 card.className = "bg-white dark:bg-[#131c31] border border-slate-200 dark:border-slate-800 rounded-lg p-2.5 transition-all duration-150 shadow-sm dark:shadow";
                 const initialDailyCount = extDailyCallsCache[ext.extension] ?? 0;
 
@@ -339,6 +389,8 @@
                         </div>
                     </div>
                     <div class="text-xs font-medium text-slate-800 dark:text-slate-200 truncate mb-1">${tr.name || key}</div>
+                    <!-- Multi-call list on Trunk with linked extension badge -->
+                    <div id="trunkcalls-${key}" class="hidden mb-1.5 space-y-1 max-h-32 overflow-y-auto"></div>
                     <div id="callinfo-${key}" class="hidden mb-1.5 px-1.5 py-0.5 rounded text-[10px] font-mono font-bold truncate"></div>
                     <div class="bg-slate-100 dark:bg-[#0b1120]/70 px-1.5 py-1 rounded border border-slate-200 dark:border-slate-800/80 space-y-1">
                         <div class="flex items-center justify-between gap-1">
@@ -371,6 +423,9 @@
             const isRegistered = !!info.registered;
             const ip = info.ip || '';
             const regSince = info.regSince || null;
+
+            const currentCallStatus = (cardStateCache[peer] && cardStateCache[peer].status) || 'IDLE';
+            applyCardVisualClasses(card, isTrunk, isRegistered, currentCallStatus);
 
             if (ipEl) {
                 if (isRegistered && ip) {
@@ -419,22 +474,42 @@
             const timerEl = document.getElementById(`timer-${peer}`);
             const hangupBtn = document.getElementById(`hangup-${peer}`);
             const callInfoEl = document.getElementById(`callinfo-${peer}`);
+            const trunkCallsEl = document.getElementById(`trunkcalls-${peer}`);
             if (!card) return;
 
-            statusText.innerText = status;
-            card.classList.remove(
-                'border-slate-200', 'dark:border-slate-800',
-                'border-rose-500', 'bg-rose-50', 'dark:bg-[#1f1627]',
-                'border-amber-500', 'bg-amber-50', 'dark:bg-[#211d18]'
-            );
+            const isTrunk = card.dataset.isTrunk === 'true';
+            const isRegistered = Boolean(regCache[peer] && regCache[peer].registered);
+
+            cardStateCache[peer] = { status, startTime, callInfo, isTrunk };
+
+            const activeCount = (isTrunk && callInfo && Array.isArray(callInfo.calls) && callInfo.calls.length > 0)
+                ? callInfo.calls.length
+                : ((status === 'INCALL' || status === 'RINGING') ? 1 : 0);
+
+            statusText.innerText = (isTrunk && activeCount > 1) ? `${status} (${activeCount})` : status;
+
+            applyCardVisualClasses(card, isTrunk, isRegistered, status);
+
             statusText.classList.remove(
                 'text-slate-500', 'dark:text-slate-400',
                 'text-rose-600', 'dark:text-rose-400',
                 'text-amber-600', 'dark:text-amber-400'
             );
 
-            // Render Incoming / Outgoing remote number badge
-            if (callInfoEl) {
+            // Render multi-call list on Trunk or single badge on Extension
+            if (isTrunk && trunkCallsEl) {
+                if ((status === 'INCALL' || status === 'RINGING') && callInfo && Array.isArray(callInfo.calls) && callInfo.calls.length > 0) {
+                    const now = Date.now();
+                    trunkCallsEl.innerHTML = callInfo.calls.map(c => renderTrunkCallItem(peer, c, now)).join('');
+                    trunkCallsEl.classList.remove('hidden');
+                    if (callInfoEl) callInfoEl.classList.add('hidden');
+                } else {
+                    trunkCallsEl.classList.add('hidden');
+                    trunkCallsEl.innerHTML = '';
+                }
+            }
+
+            if (callInfoEl && !isTrunk) {
                 if ((status === 'INCALL' || status === 'RINGING') && callInfo && callInfo.number) {
                     const dirLabel = callInfo.dir === 'OUT' ? 'OUT' : 'IN';
                     callInfoEl.innerText = `${dirLabel}: ${callInfo.number}`;
@@ -452,7 +527,6 @@
             }
 
             if (status === 'INCALL') {
-                card.classList.add('border-rose-500', 'bg-rose-50', 'dark:bg-[#1f1627]');
                 statusText.classList.add('text-rose-600', 'dark:text-rose-400');
                 if (hangupBtn) hangupBtn.classList.remove('opacity-40', 'pointer-events-none');
                 if (timerEl) {
@@ -461,7 +535,6 @@
                     timerEl.classList.remove('hidden');
                 }
             } else if (status === 'RINGING') {
-                card.classList.add('border-amber-500', 'bg-amber-50', 'dark:bg-[#211d18]');
                 statusText.classList.add('text-amber-600', 'dark:text-amber-400');
                 if (hangupBtn) hangupBtn.classList.remove('opacity-40', 'pointer-events-none');
                 if (timerEl) {
@@ -469,7 +542,6 @@
                     timerEl.classList.add('hidden');
                 }
             } else {
-                card.classList.add('border-slate-200', 'dark:border-slate-800');
                 statusText.classList.add('text-slate-500', 'dark:text-slate-400');
                 if (hangupBtn) hangupBtn.classList.add('opacity-40', 'pointer-events-none');
                 if (timerEl) {
