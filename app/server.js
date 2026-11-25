@@ -183,6 +183,32 @@ function getCorrelatedChannels(linkedid, bridgeid = '') {
     );
 }
 
+// Apply explicit internal extension-to-extension IN/OUT details when both caller & callee are extensions
+function applyInternalExtCall(callerExt, calleeExt, linkedid = '', bridgeid = '', stateDesc = '') {
+    const src = callerExt ? String(callerExt).trim() : '';
+    const dst = calleeExt ? String(calleeExt).trim() : '';
+
+    if (src && isExtensionPeer(src) && dst && isExtensionPeer(dst) && src !== dst) {
+        callDetails[src] = { dir: 'OUT', number: dst, linkedid, bridgeid };
+        callDetails[dst] = { dir: 'IN', number: src, linkedid, bridgeid };
+
+        if (stateDesc === 'Up') {
+            peerStatuses[src] = 'INCALL';
+            peerStatuses[dst] = 'INCALL';
+            if (!callStartTimes[src]) callStartTimes[src] = Date.now();
+            if (!callStartTimes[dst]) callStartTimes[dst] = Date.now();
+        } else {
+            if (peerStatuses[src] !== 'INCALL') peerStatuses[src] = 'RINGING';
+            if (peerStatuses[dst] !== 'INCALL') peerStatuses[dst] = 'RINGING';
+        }
+
+        emitPeerUpdate(src);
+        emitPeerUpdate(dst);
+        return true;
+    }
+    return false;
+}
+
 // Find extension associated with a given linkedid / bridgeid
 function findLinkedExtension(linkedid, bridgeid = '', excludeExt = null) {
     const legs = getCorrelatedChannels(linkedid, bridgeid);
@@ -603,7 +629,7 @@ function pollRegistrations() {
     });
 }
 
-// Reconcile active channels to prevent stale states & handle macro-dialout-trunk + AppDial (Outgoing Line)
+// Reconcile active channels to prevent stale states & handle internal calls + trunk calls
 function syncActiveChannels() {
     ami.action({ action: 'Command', command: 'core show channels concise' }, (err, res) => {
         if (err || !res) return;
@@ -692,12 +718,6 @@ function syncActiveChannels() {
                     });
                     emitPeerUpdate(peer);
                 } else {
-                    const isOutExt = Boolean(
-                        isOutgoingContext(context, channel) ||
-                        dialedFromApp ||
-                        (context.includes('from-internal') && isValidNumber(exten, peer))
-                    );
-
                     if (state === 'Up' || state === 'Ring' || state === 'Ringing') {
                         if (state === 'Up') {
                             peerStatuses[peer] = 'INCALL';
@@ -709,20 +729,31 @@ function syncActiveChannels() {
                         const outNum = dialedFromApp || (isValidNumber(exten, peer) ? exten : ((outMeta && outMeta.number) || ''));
                         const inNum = isValidNumber(callerNum, peer) ? callerNum : (isValidNumber(connectedNum, peer) ? connectedNum : '');
 
-                        if (isOutExt && isValidNumber(outNum, peer)) {
-                            callDetails[peer] = {
-                                dir: 'OUT',
-                                number: outNum,
-                                linkedid,
-                                bridgeid: bridgeId
-                            };
-                        } else if (!callDetails[peer] && isValidNumber(inNum, peer)) {
-                            callDetails[peer] = {
-                                dir: 'IN',
-                                number: inNum,
-                                linkedid,
-                                bridgeid: bridgeId
-                            };
+                        if (isExtensionPeer(peer) && isValidNumber(outNum, peer) && isExtensionPeer(outNum)) {
+                            applyInternalExtCall(peer, outNum, linkedid, bridgeId, state);
+                        } else if (isExtensionPeer(peer) && isValidNumber(inNum, peer) && isExtensionPeer(inNum)) {
+                            applyInternalExtCall(inNum, peer, linkedid, bridgeId, state);
+                        } else {
+                            const isOutExt = Boolean(
+                                isOutgoingContext(context, channel) ||
+                                dialedFromApp ||
+                                (context.includes('from-internal') && isValidNumber(exten, peer))
+                            );
+                            if (isOutExt && isValidNumber(outNum, peer)) {
+                                callDetails[peer] = {
+                                    dir: 'OUT',
+                                    number: outNum,
+                                    linkedid,
+                                    bridgeid: bridgeId
+                                };
+                            } else if (!callDetails[peer] && isValidNumber(inNum, peer)) {
+                                callDetails[peer] = {
+                                    dir: 'IN',
+                                    number: inNum,
+                                    linkedid,
+                                    bridgeid: bridgeId
+                                };
+                            }
                         }
                         emitPeerUpdate(peer);
                         refreshTrunksForExtension(peer);
@@ -827,7 +858,18 @@ ami.on('managerevent', (evt) => {
                 });
                 emitPeerUpdate(peer);
             } else {
-                if (incomingTrunkLeg || context.includes('ext-queues') || context.includes('ext-group') || context.includes('from-trunk') || context.includes('from-pstn')) {
+                const otherLeg = linked.find(c => !c.isTrunk && c.peer && isExtensionPeer(c.peer) && c.peer !== peer);
+                if (isExtensionPeer(peer) && isValidNumber(dialedExten, peer) && isExtensionPeer(dialedExten)) {
+                    applyInternalExtCall(peer, dialedExten, linkedid, '', evt.channelstatedesc);
+                } else if (isExtensionPeer(peer) && isValidNumber(callerNum, peer) && isExtensionPeer(callerNum)) {
+                    applyInternalExtCall(callerNum, peer, linkedid, '', evt.channelstatedesc);
+                } else if (otherLeg && isExtensionPeer(peer)) {
+                    if (isOutgoingContext(context, evt.channel) || callerNum === peer) {
+                        applyInternalExtCall(peer, otherLeg.peer, linkedid, '', evt.channelstatedesc);
+                    } else {
+                        applyInternalExtCall(otherLeg.peer, peer, linkedid, '', evt.channelstatedesc);
+                    }
+                } else if (incomingTrunkLeg || context.includes('ext-queues') || context.includes('ext-group') || context.includes('from-trunk') || context.includes('from-pstn')) {
                     const externalCaller = resolveLinkedNumber(linkedid, peer, false) || (isValidNumber(callerNum, peer) ? callerNum : '');
                     if (isValidNumber(externalCaller, peer)) {
                         callDetails[peer] = { dir: 'IN', number: externalCaller, linkedid };
@@ -861,6 +903,11 @@ ami.on('managerevent', (evt) => {
         const ctx = (evt.context || '').toLowerCase();
         const linked = getCorrelatedChannels(linkedid);
         const hasIncomingTrunk = linked.some(c => c.isTrunk && !isOutgoingContext(c.context, c.channel) && (c.context.includes('from-trunk') || c.context.includes('from-pstn') || c.context.includes('from-did')));
+
+        if (srcPeer && !isTrunkPeer(srcPeer) && destPeer && !isTrunkPeer(destPeer) && isExtensionPeer(srcPeer) && isExtensionPeer(destPeer)) {
+            applyInternalExtCall(srcPeer, destPeer, linkedid, '', 'Ring');
+            return;
+        }
 
         if (srcPeer && !isTrunkPeer(srcPeer) && destPeer && isTrunkPeer(destPeer)) {
             const rawTarget = extractDialedNumberFromData(evt.dialstring)
@@ -902,9 +949,13 @@ ami.on('managerevent', (evt) => {
                     || (isValidNumber(destPeer, srcPeer) ? destPeer : resolveLinkedNumber(linkedid, srcPeer, true));
                 const cleanDest = String(rawDest || '').replace(/^.*\/([^@]+).*$/, '$1');
                 if (isValidNumber(cleanDest, srcPeer)) {
-                    const dir = isOutgoingContext(ctx, evt.channel) || isExtensionPeer(srcPeer) ? 'OUT' : 'IN';
-                    callDetails[srcPeer] = { dir, number: cleanDest, linkedid };
-                    emitPeerUpdate(srcPeer);
+                    if (isExtensionPeer(srcPeer) && isExtensionPeer(cleanDest)) {
+                        applyInternalExtCall(srcPeer, cleanDest, linkedid, '', 'Ring');
+                    } else {
+                        const dir = isOutgoingContext(ctx, evt.channel) || isExtensionPeer(srcPeer) ? 'OUT' : 'IN';
+                        callDetails[srcPeer] = { dir, number: cleanDest, linkedid };
+                        emitPeerUpdate(srcPeer);
+                    }
                 }
             }
         }
@@ -936,14 +987,18 @@ ami.on('managerevent', (evt) => {
             } else {
                 const incomingNum = resolveLinkedNumber(linkedid, destPeer, false)
                     || (isValidNumber(srcCaller, destPeer) ? srcCaller : (isValidNumber(srcPeer, destPeer) ? srcPeer : ''));
-                if (isValidNumber(incomingNum, destPeer)) {
-                    callDetails[destPeer] = { dir: 'IN', number: incomingNum, linkedid };
+                if (isExtensionPeer(destPeer) && isValidNumber(incomingNum, destPeer) && isExtensionPeer(incomingNum)) {
+                    applyInternalExtCall(incomingNum, destPeer, linkedid, '', 'Ring');
+                } else {
+                    if (isValidNumber(incomingNum, destPeer)) {
+                        callDetails[destPeer] = { dir: 'IN', number: incomingNum, linkedid };
+                    }
+                    if (peerStatuses[destPeer] !== 'INCALL') {
+                        peerStatuses[destPeer] = 'RINGING';
+                    }
+                    emitPeerUpdate(destPeer);
+                    refreshTrunksForExtension(destPeer);
                 }
-                if (peerStatuses[destPeer] !== 'INCALL') {
-                    peerStatuses[destPeer] = 'RINGING';
-                }
-                emitPeerUpdate(destPeer);
-                refreshTrunksForExtension(destPeer);
             }
         }
     }
@@ -983,10 +1038,27 @@ ami.on('managerevent', (evt) => {
                     const remote = resolveLinkedNumber(linkedid, peer, false)
                         || (isValidNumber(connectedNum, peer) ? connectedNum : (isValidNumber(callerNum, peer) ? callerNum : ''));
                     if (isValidNumber(remote, peer)) {
-                        callDetails[peer] = { dir: 'IN', number: remote, linkedid };
+                        if (isExtensionPeer(peer) && isExtensionPeer(remote)) {
+                            const existingDet = callDetails[remote];
+                            if (existingDet && existingDet.dir === 'OUT' && existingDet.number === peer) {
+                                applyInternalExtCall(remote, peer, linkedid, '', stateDesc);
+                            } else {
+                                applyInternalExtCall(peer, remote, linkedid, '', stateDesc);
+                            }
+                        } else {
+                            callDetails[peer] = { dir: 'IN', number: remote, linkedid };
+                        }
                     }
                 } else {
                     callDetails[peer].linkedid = linkedid;
+                    if (isExtensionPeer(peer) && isExtensionPeer(callDetails[peer].number)) {
+                        const otherExt = callDetails[peer].number;
+                        if (callDetails[peer].dir === 'OUT') {
+                            applyInternalExtCall(peer, otherExt, linkedid, '', stateDesc);
+                        } else {
+                            applyInternalExtCall(otherExt, peer, linkedid, '', stateDesc);
+                        }
+                    }
                 }
 
                 if (stateDesc === 'Up') {
@@ -1035,20 +1107,31 @@ ami.on('managerevent', (evt) => {
                 });
                 emitPeerUpdate(peer);
             } else {
-                peerStatuses[peer] = 'INCALL';
-                if (!callStartTimes[peer]) callStartTimes[peer] = Date.now();
-                if (!callDetails[peer]) {
-                    const remote = resolveLinkedNumber(linkedid, peer, false, bridgeid)
-                        || (isValidNumber(connectedNum, peer) ? connectedNum : (isValidNumber(callerNum, peer) ? callerNum : ''));
-                    if (isValidNumber(remote, peer)) {
-                        callDetails[peer] = { dir: 'IN', number: remote, linkedid, bridgeid };
+                const remote = resolveLinkedNumber(linkedid, peer, false, bridgeid)
+                    || (isValidNumber(connectedNum, peer) ? connectedNum : (isValidNumber(callerNum, peer) ? callerNum : ''));
+                if (isExtensionPeer(peer) && isValidNumber(remote, peer) && isExtensionPeer(remote)) {
+                    const existingDet = callDetails[remote];
+                    if (existingDet && existingDet.dir === 'OUT' && existingDet.number === peer) {
+                        applyInternalExtCall(remote, peer, linkedid, bridgeid, 'Up');
+                    } else if (callDetails[peer] && callDetails[peer].dir === 'OUT' && callDetails[peer].number === remote) {
+                        applyInternalExtCall(peer, remote, linkedid, bridgeid, 'Up');
+                    } else {
+                        applyInternalExtCall(remote, peer, linkedid, bridgeid, 'Up');
                     }
                 } else {
-                    callDetails[peer].linkedid = linkedid;
-                    callDetails[peer].bridgeid = bridgeid;
+                    peerStatuses[peer] = 'INCALL';
+                    if (!callStartTimes[peer]) callStartTimes[peer] = Date.now();
+                    if (!callDetails[peer]) {
+                        if (isValidNumber(remote, peer)) {
+                            callDetails[peer] = { dir: 'IN', number: remote, linkedid, bridgeid };
+                        }
+                    } else {
+                        callDetails[peer].linkedid = linkedid;
+                        callDetails[peer].bridgeid = bridgeid;
+                    }
+                    emitPeerUpdate(peer);
+                    refreshTrunksForExtension(peer);
                 }
-                emitPeerUpdate(peer);
-                refreshTrunksForExtension(peer);
             }
         }
     }
