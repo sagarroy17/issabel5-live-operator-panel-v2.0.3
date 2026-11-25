@@ -22,11 +22,12 @@
         </div>
 
         <div class="flex flex-wrap items-center gap-2">
-            <!-- Active Calls Counter -->
-            <div class="flex items-center gap-1.5 text-xs font-semibold bg-rose-50 text-rose-700 border border-rose-200 dark:bg-rose-950/60 dark:text-rose-300 dark:border-rose-800/70 px-2.5 py-1 rounded-full">
+            <!-- Active Calls Counter (Click to open Active Extension Calls View) -->
+            <button type="button" onclick="openActiveCallsView()" title="Click to view active extension calls"
+                    class="flex items-center gap-1.5 text-xs font-semibold bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 dark:bg-rose-950/60 dark:hover:bg-rose-900/70 dark:text-rose-300 dark:border-rose-800/70 px-2.5 py-1 rounded-full transition cursor-pointer">
                 <span>Active Calls:</span>
                 <span id="stat-total-calls" class="font-mono font-bold">0</span>
-            </div>
+            </button>
 
             <!-- Today's Processed Calls Counter -->
             <div class="flex items-center gap-1.5 text-xs font-semibold bg-blue-50 text-blue-700 border border-blue-200 dark:bg-blue-950/60 dark:text-blue-300 dark:border-blue-800/70 px-2.5 py-1 rounded-full">
@@ -55,22 +56,40 @@
         </div>
     </div>
 
-    <!-- Extensions Grid Section -->
-    <div class="mb-6">
-        <div class="flex items-center gap-2 mb-2.5">
-            <h2 class="text-xs font-bold uppercase tracking-wider text-slate-600 dark:text-slate-300">Extensions</h2>
-            <span id="ext-count" class="text-[11px] font-semibold bg-slate-200 text-slate-700 dark:bg-slate-800 dark:text-slate-300 px-2 py-0.5 rounded-full">0</span>
+    <!-- Main Live Operator Panel View -->
+    <div id="panel-main-view">
+        <!-- Extensions Grid Section -->
+        <div class="mb-6">
+            <div class="flex items-center gap-2 mb-2.5">
+                <h2 class="text-xs font-bold uppercase tracking-wider text-slate-600 dark:text-slate-300">Extensions</h2>
+                <span id="ext-count" class="text-[11px] font-semibold bg-slate-200 text-slate-700 dark:bg-slate-800 dark:text-slate-300 px-2 py-0.5 rounded-full">0</span>
+            </div>
+            <div id="extension-grid" class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-2.5"></div>
         </div>
-        <div id="extension-grid" class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-2.5"></div>
+
+        <!-- SIP / IAX Trunks Grid Section -->
+        <div class="pt-4 border-t border-slate-200 dark:border-slate-800">
+            <div class="flex items-center gap-2 mb-2.5">
+                <h2 class="text-xs font-bold uppercase tracking-wider text-cyan-700 dark:text-cyan-400">SIP / IAX Trunks</h2>
+                <span id="trunk-count" class="text-[11px] font-semibold bg-slate-200 text-slate-700 dark:bg-slate-800 dark:text-slate-300 px-2 py-0.5 rounded-full">0</span>
+            </div>
+            <div id="trunk-grid" class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-2.5"></div>
+        </div>
     </div>
 
-    <!-- SIP / IAX Trunks Grid Section -->
-    <div class="pt-4 border-t border-slate-200 dark:border-slate-800">
-        <div class="flex items-center gap-2 mb-2.5">
-            <h2 class="text-xs font-bold uppercase tracking-wider text-cyan-700 dark:text-cyan-400">SIP / IAX Trunks</h2>
-            <span id="trunk-count" class="text-[11px] font-semibold bg-slate-200 text-slate-700 dark:bg-slate-800 dark:text-slate-300 px-2 py-0.5 rounded-full">0</span>
+    <!-- Active Extension Calls View (Opened on Active Calls click, closed via Back button) -->
+    <div id="active-calls-view" class="hidden">
+        <div class="flex flex-wrap items-center justify-between gap-2 mb-4 pb-2.5 border-b border-slate-200 dark:border-slate-800">
+            <div class="flex items-center gap-2">
+                <button type="button" onclick="closeActiveCallsView()"
+                        class="flex items-center gap-1.5 text-xs font-semibold bg-white hover:bg-slate-100 text-slate-800 border border-slate-300 dark:bg-slate-800 dark:hover:bg-slate-700 dark:text-white dark:border-slate-700 px-3 py-1.5 rounded-lg transition cursor-pointer">
+                    <span>← Back</span>
+                </button>
+                <h2 class="text-sm font-bold uppercase tracking-wider text-rose-600 dark:text-rose-400">Active Extension Calls</h2>
+                <span id="active-view-count" class="text-[11px] font-semibold bg-rose-100 text-rose-700 dark:bg-rose-950 dark:text-rose-300 px-2 py-0.5 rounded-full">0</span>
+            </div>
         </div>
-        <div id="trunk-grid" class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-2.5"></div>
+        <div id="active-calls-list" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3"></div>
     </div>
 
     <!-- Fixed Transparent Bottom-Right Server Telemetry & Clock Widget -->
@@ -195,6 +214,79 @@
         const regCache = {};
         const cardStateCache = {};
         let extDailyCallsCache = {};
+        let isActiveCallsViewOpen = false;
+
+        function openActiveCallsView() {
+            isActiveCallsViewOpen = true;
+            const mainView = document.getElementById('panel-main-view');
+            const activeView = document.getElementById('active-calls-view');
+            if (mainView) mainView.classList.add('hidden');
+            if (activeView) activeView.classList.remove('hidden');
+            renderActiveCallsView();
+        }
+
+        function closeActiveCallsView() {
+            isActiveCallsViewOpen = false;
+            const activeView = document.getElementById('active-calls-view');
+            const mainView = document.getElementById('panel-main-view');
+            if (activeView) activeView.classList.add('hidden');
+            if (mainView) mainView.classList.remove('hidden');
+        }
+
+        function renderActiveCallsView() {
+            if (!isActiveCallsViewOpen) return;
+            const listEl = document.getElementById('active-calls-list');
+            const countEl = document.getElementById('active-view-count');
+            if (!listEl) return;
+
+            const activeExts = Object.entries(cardStateCache)
+                .filter(([peer, st]) => st && !st.isTrunk && (st.status === 'INCALL' || st.status === 'RINGING'));
+
+            if (countEl) countEl.innerText = activeExts.length;
+
+            if (activeExts.length === 0) {
+                listEl.innerHTML = `
+                    <div class="col-span-full bg-white dark:bg-[#131c31] border border-slate-200 dark:border-slate-800 rounded-lg p-6 text-center text-xs text-slate-500 dark:text-slate-400">
+                        No active extension calls right now.
+                    </div>
+                `;
+                return;
+            }
+
+            const now = Date.now();
+            listEl.innerHTML = activeExts.map(([exten, st]) => {
+                const dir = (st.callInfo && st.callInfo.dir) ? st.callInfo.dir : 'CALL';
+                const num = (st.callInfo && st.callInfo.number) ? st.callInfo.number : 'Connected';
+                const dur = (st.status === 'INCALL' && activeTimers[exten]) ? formatCallDuration(now - activeTimers[exten]) : 'RINGING';
+                const badgeClass = st.status === 'INCALL'
+                    ? 'bg-rose-100 text-rose-700 border-rose-300 dark:bg-rose-950 dark:text-rose-300 dark:border-rose-700/70'
+                    : 'bg-amber-100 text-amber-800 border-amber-300 dark:bg-amber-950 dark:text-amber-300 dark:border-amber-700/70';
+
+                return `
+                    <div class="bg-white dark:bg-[#131c31] border border-slate-200 dark:border-slate-800 rounded-lg p-3 shadow-sm space-y-2">
+                        <div class="flex items-center justify-between">
+                            <span class="font-bold text-sm text-blue-600 dark:text-sky-400">${exten}</span>
+                            <span class="text-[10px] font-bold px-2 py-0.5 rounded border ${badgeClass}">${st.status}</span>
+                        </div>
+                        <div class="text-xs font-mono font-semibold text-slate-800 dark:text-slate-200">
+                            ${dir}: ${num}
+                        </div>
+                        <div class="flex items-center justify-between text-[11px] text-slate-500 dark:text-slate-400">
+                            <span>Duration:</span>
+                            <span class="font-mono font-bold text-slate-700 dark:text-slate-200">${dur}</span>
+                        </div>
+                        <div class="grid grid-cols-2 gap-2 pt-1">
+                            <button onclick="resetExt('${exten}')" class="bg-amber-50 hover:bg-amber-500 text-amber-700 hover:text-white dark:bg-slate-800 dark:hover:bg-amber-600 dark:text-amber-300 dark:hover:text-white text-[11px] font-semibold py-1 rounded border border-amber-300 dark:border-slate-700 transition">
+                                Reset
+                            </button>
+                            <button onclick="hangupExt('${exten}')" class="bg-rose-50 hover:bg-rose-600 text-rose-700 hover:text-white dark:bg-rose-950/70 dark:hover:bg-rose-600 dark:text-rose-200 dark:hover:text-white text-[11px] font-semibold py-1 rounded border border-rose-300 dark:border-rose-800 transition">
+                                Hangup
+                            </button>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+        }
 
         function formatCallDuration(ms) {
             const totalSec = Math.max(0, Math.floor(ms / 1000));
@@ -219,7 +311,7 @@
         function renderTrunkCallItem(trPeer, c, now) {
             const dirLabel = c.dir === 'OUT' ? 'OUT' : 'IN';
             const numText = c.number || 'Active';
-            const extBadge = c.exten ? `<span class="px-1 py-0.2 rounded bg-sky-500/20 text-sky-300 border border-sky-500/40 text-[9px] font-bold shrink-0">#${c.exten}</span>` : '';
+            const extBadge = c.exten ? `<span class="px-1 py-0.2 rounded bg-sky-500/20 text-sky-300 border border-sky-500/40 text-[9px] font-bold shrink-0">${c.exten}</span>` : '';
             const durText = c.status === 'INCALL' && c.startTime ? formatCallDuration(now - c.startTime) : 'RING';
             const badgeCls = dirLabel === 'OUT'
                 ? 'bg-amber-100/90 text-amber-900 border-amber-300 dark:bg-amber-950/85 dark:text-amber-200 dark:border-amber-700/70'
@@ -263,6 +355,8 @@
                     }
                 }
             });
+
+            renderActiveCallsView();
         }, 1000);
 
         function updateCallSummaryUI(summary) {
@@ -325,7 +419,7 @@
 
                     card.innerHTML = `
                         <div class="flex justify-between items-center mb-1">
-                            <span class="text-blue-600 dark:text-[#60a5fa] font-bold text-sm">#${ext.extension}</span>
+                            <span class="text-blue-600 dark:text-[#60a5fa] font-bold text-sm">${ext.extension}</span>
                             <div class="flex items-center gap-1">
                                 <span id="timer-${ext.extension}" class="hidden text-[10px] font-mono font-bold bg-rose-100 text-rose-700 border border-rose-300 dark:bg-rose-950 dark:text-rose-300 dark:border-rose-700/60 px-1.5 py-0.2 rounded">00:00</span>
                                 <span id="status-${ext.extension}" class="text-[10px] font-bold tracking-wider uppercase text-slate-500 dark:text-slate-400">IDLE</span>
@@ -351,7 +445,7 @@
                             </div>
                         </div>
                         <div class="grid grid-cols-2 gap-1.5">
-                            <button onclick="resetExt('${ext.extension}')" title="Reset hung extension to normal state"
+                            <button onclick="resetExt('${ext.extension}')" title="Reset & clear hung call session on this extension only"
                                     class="bg-amber-50 hover:bg-amber-500 text-amber-700 hover:text-white dark:bg-[#1e293b] dark:hover:bg-amber-600 dark:text-amber-300 dark:hover:text-white text-[11px] font-semibold py-1 rounded border border-amber-300 dark:border-slate-700 transition">
                                 Reset
                             </button>
@@ -566,6 +660,8 @@
                     timerEl.innerText = '00:00';
                 }
             }
+
+            renderActiveCallsView();
         }
 
         // Socket.io Event Listeners
@@ -584,6 +680,7 @@
                     );
                 });
             }
+            renderActiveCallsView();
         });
 
         socket.on('reg_status', ({ peer, registered, ip, regSince }) => {
@@ -622,6 +719,7 @@
 
         function resetExt(targetExten) {
             socket.emit('action_reset', { exten: targetExten });
+            delete activeTimers[targetExten];
             updateCardUI(targetExten, 'IDLE', null, null);
         }
 
