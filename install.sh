@@ -56,7 +56,7 @@ systemctl daemon-reload && systemctl enable operator-panel && systemctl restart 
 mkdir -p "$ISSABEL_MOD_DIR"
 cat << 'PHPEOF' > "$ISSABEL_MOD_DIR/index.php"
 <?php
-function _moduleContent(&$smarty,$module_name)
+function _moduleContent(&$smarty, $module_name)
 {
     return '<div style="margin:0; padding:0; width:100%; height:calc(100vh - 70px); overflow:hidden;">
                 <iframe src="/op-panel/" style="width:100%; height:100%; border:none; display:block;" allowfullscreen></iframe>
@@ -64,7 +64,7 @@ function _moduleContent(&$smarty,$module_name)
 }
 ?>
 PHPEOF
-chown -R asterisk:asterisk "$ISSABEL_MOD_DIR"
+chown -R asterisk:asterisk "$ISSABEL_MOD_DIR" 2>/dev/null || true
 
 # Auto-detect exact PBX parent ID (pbxconfig or pbx) and prevent duplicate menu items
 PBX_PARENT=$(sqlite3 /var/www/db/menu.db "SELECT IdParent FROM menu WHERE id IN ('pbxadmin','voicemail','conference','fop2') AND IdParent != '' LIMIT 1;")
@@ -80,10 +80,10 @@ if [ -z "$ID_RES" ]; then
 fi
 sqlite3 /var/www/db/acl.db "INSERT OR IGNORE INTO acl_group_permission (id_action, id_group, id_resource) VALUES (1, 1, $ID_RES);"
 
-chown -R asterisk:asterisk /var/www/db /var/www/html/var
-chmod 775 /var/www/db
-chmod 664 /var/www/db/*.db
-rm -rf /var/www/html/var/templates_c/* /var/lib/php/session/*
+chown asterisk:asterisk /var/www/db/menu.db /var/www/db/acl.db 2>/dev/null || true
+chown -R asterisk:asterisk /var/www/html/var 2>/dev/null || true
+chmod 664 /var/www/db/menu.db /var/www/db/acl.db 2>/dev/null || true
+rm -rf /var/www/html/var/templates_c/* /var/lib/php/session/* 2>/dev/null || true
 
 SSL_CONF="/etc/httpd/conf.d/ssl.conf"
 if [ -f "$SSL_CONF" ]; then
