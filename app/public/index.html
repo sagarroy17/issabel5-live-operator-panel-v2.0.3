@@ -233,6 +233,54 @@
             if (mainView) mainView.classList.remove('hidden');
         }
 
+        function getActiveExtCardHtml(exten, st, now) {
+            const dir = (st.callInfo && st.callInfo.dir) ? st.callInfo.dir : 'CALL';
+            const num = (st.callInfo && st.callInfo.number) ? st.callInfo.number : 'Connected';
+            const dur = (st.status === 'INCALL' && activeTimers[exten]) ? formatCallDuration(now - activeTimers[exten]) : 'RINGING';
+            const badgeClass = st.status === 'INCALL'
+                ? 'bg-rose-100 text-rose-700 border-rose-300 dark:bg-rose-950 dark:text-rose-300 dark:border-rose-700/70'
+                : 'bg-amber-100 text-amber-800 border-amber-300 dark:bg-amber-950 dark:text-amber-300 dark:border-amber-700/70';
+
+            return `
+                <div id="active-view-card-${exten}" class="bg-white dark:bg-[#131c31] border border-slate-200 dark:border-slate-800 rounded-lg p-3 shadow-sm space-y-2">
+                    <div class="flex items-center justify-between">
+                        <span class="font-bold text-sm text-blue-600 dark:text-sky-400">${exten}</span>
+                        <span id="active-view-status-${exten}" class="text-[10px] font-bold px-2 py-0.5 rounded border ${badgeClass}">${st.status}</span>
+                    </div>
+                    <div id="active-view-call-${exten}" class="text-xs font-mono font-semibold text-slate-800 dark:text-slate-200">
+                        ${dir}: ${num}
+                    </div>
+                    <div class="flex items-center justify-between text-[11px] text-slate-500 dark:text-slate-400">
+                        <span>Duration:</span>
+                        <span id="active-view-dur-${exten}" class="font-mono font-bold text-slate-700 dark:text-slate-200">${dur}</span>
+                    </div>
+                    <div class="grid grid-cols-2 gap-2 pt-1">
+                        <button onclick="resetExt('${exten}')" class="bg-amber-50 hover:bg-amber-500 text-amber-700 hover:text-white dark:bg-slate-800 dark:hover:bg-amber-600 dark:text-amber-300 dark:hover:text-white text-[11px] font-semibold py-1 rounded border border-amber-300 dark:border-slate-700 transition">
+                            Reset
+                        </button>
+                        <button onclick="hangupExt('${exten}')" class="bg-rose-50 hover:bg-rose-600 text-rose-700 hover:text-white dark:bg-rose-950/70 dark:hover:bg-rose-600 dark:text-rose-200 dark:hover:text-white text-[11px] font-semibold py-1 rounded border border-rose-300 dark:border-rose-800 transition">
+                            Hangup
+                        </button>
+                    </div>
+                </div>
+            `;
+        }
+
+        function tickActiveCallsDurationOnly() {
+            if (!isActiveCallsViewOpen) return;
+            const now = Date.now();
+            Object.entries(cardStateCache).forEach(([peer, st]) => {
+                if (!st || st.isTrunk) return;
+                const durEl = document.getElementById(`active-view-dur-${peer}`);
+                if (!durEl) return;
+                if (st.status === 'INCALL' && activeTimers[peer]) {
+                    durEl.innerText = formatCallDuration(now - activeTimers[peer]);
+                } else if (st.status === 'RINGING') {
+                    durEl.innerText = 'RINGING';
+                }
+            });
+        }
+
         function renderActiveCallsView() {
             if (!isActiveCallsViewOpen) return;
             const listEl = document.getElementById('active-calls-list');
@@ -253,39 +301,30 @@
                 return;
             }
 
-            const now = Date.now();
-            listEl.innerHTML = activeExts.map(([exten, st]) => {
-                const dir = (st.callInfo && st.callInfo.dir) ? st.callInfo.dir : 'CALL';
-                const num = (st.callInfo && st.callInfo.number) ? st.callInfo.number : 'Connected';
-                const dur = (st.status === 'INCALL' && activeTimers[exten]) ? formatCallDuration(now - activeTimers[exten]) : 'RINGING';
-                const badgeClass = st.status === 'INCALL'
-                    ? 'bg-rose-100 text-rose-700 border-rose-300 dark:bg-rose-950 dark:text-rose-300 dark:border-rose-700/70'
-                    : 'bg-amber-100 text-amber-800 border-amber-300 dark:bg-amber-950 dark:text-amber-300 dark:border-amber-700/70';
+            const existingIds = Array.from(listEl.children)
+                .map(el => el.id)
+                .filter(id => id && id.startsWith('active-view-card-'))
+                .map(id => id.replace('active-view-card-', ''));
 
-                return `
-                    <div class="bg-white dark:bg-[#131c31] border border-slate-200 dark:border-slate-800 rounded-lg p-3 shadow-sm space-y-2">
-                        <div class="flex items-center justify-between">
-                            <span class="font-bold text-sm text-blue-600 dark:text-sky-400">${exten}</span>
-                            <span class="text-[10px] font-bold px-2 py-0.5 rounded border ${badgeClass}">${st.status}</span>
-                        </div>
-                        <div class="text-xs font-mono font-semibold text-slate-800 dark:text-slate-200">
-                            ${dir}: ${num}
-                        </div>
-                        <div class="flex items-center justify-between text-[11px] text-slate-500 dark:text-slate-400">
-                            <span>Duration:</span>
-                            <span class="font-mono font-bold text-slate-700 dark:text-slate-200">${dur}</span>
-                        </div>
-                        <div class="grid grid-cols-2 gap-2 pt-1">
-                            <button onclick="resetExt('${exten}')" class="bg-amber-50 hover:bg-amber-500 text-amber-700 hover:text-white dark:bg-slate-800 dark:hover:bg-amber-600 dark:text-amber-300 dark:hover:text-white text-[11px] font-semibold py-1 rounded border border-amber-300 dark:border-slate-700 transition">
-                                Reset
-                            </button>
-                            <button onclick="hangupExt('${exten}')" class="bg-rose-50 hover:bg-rose-600 text-rose-700 hover:text-white dark:bg-rose-950/70 dark:hover:bg-rose-600 dark:text-rose-200 dark:hover:text-white text-[11px] font-semibold py-1 rounded border border-rose-300 dark:border-rose-800 transition">
-                                Hangup
-                            </button>
-                        </div>
-                    </div>
-                `;
-            }).join('');
+            const targetIds = activeExts.map(([exten]) => exten);
+            const sameList = existingIds.length === targetIds.length && existingIds.every((id, idx) => id === targetIds[idx]);
+
+            const now = Date.now();
+            if (!sameList) {
+                listEl.innerHTML = activeExts.map(([exten, st]) => getActiveExtCardHtml(exten, st, now)).join('');
+            } else {
+                activeExts.forEach(([exten, st]) => {
+                    const dir = (st.callInfo && st.callInfo.dir) ? st.callInfo.dir : 'CALL';
+                    const num = (st.callInfo && st.callInfo.number) ? st.callInfo.number : 'Connected';
+                    const callEl = document.getElementById(`active-view-call-${exten}`);
+                    const statusBadge = document.getElementById(`active-view-status-${exten}`);
+                    if (callEl) callEl.innerText = `${dir}: ${num}`;
+                    if (statusBadge && statusBadge.innerText !== st.status) {
+                        statusBadge.innerText = st.status;
+                    }
+                });
+                tickActiveCallsDurationOnly();
+            }
         }
 
         function formatCallDuration(ms) {
@@ -356,7 +395,7 @@
                 }
             });
 
-            renderActiveCallsView();
+            tickActiveCallsDurationOnly();
         }, 1000);
 
         function updateCallSummaryUI(summary) {
