@@ -5,19 +5,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_DIR="/opt/custom-operator-panel"
 ISSABEL_MOD_DIR="/var/www/html/modules/live_operator_panel"
 
-echo "[1/6] Checking Node.js..."
 if ! command -v node &> /dev/null || [[ "$(node -v | cut -d'.' -f1 | tr -d 'v')" -lt 18 ]]; then
     curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -
     yum install -y nodejs
 fi
 
-echo "[2/6] Copying Application Files..."
 mkdir -p "$APP_DIR/public"
 cp -f "$SCRIPT_DIR/app/package.json" "$APP_DIR/package.json"
 cp -f "$SCRIPT_DIR/app/server.js" "$APP_DIR/server.js"
 cp -f "$SCRIPT_DIR/app/public/index.html" "$APP_DIR/public/index.html"
 
-echo "[3/6] Auto-configuring MySQL & Asterisk AMI Credentials..."
 node -e '
 const fs = require("fs");
 let mysqlPass = "admin";
@@ -37,7 +34,6 @@ code = code.replace(/new AsteriskManager\(5038,\s*["'\'']127\.0\.0\.1["'\''],\s*
 fs.writeFileSync("/opt/custom-operator-panel/server.js", code);
 '
 
-echo "[4/6] Installing Node Dependencies & Starting Service..."
 cd "$APP_DIR" && npm install --production --silent
 
 cat << 'SVCEOF' > /etc/systemd/system/operator-panel.service
@@ -55,15 +51,12 @@ RestartSec=3
 WantedBy=multi-user.target
 SVCEOF
 
-systemctl daemon-reload
-systemctl enable operator-panel
-systemctl restart operator-panel
+systemctl daemon-reload && systemctl enable operator-panel && systemctl restart operator-panel
 
-echo "[5/6] Registering Issabel Web GUI Module..."
 mkdir -p "$ISSABEL_MOD_DIR"
 cat << 'PHPEOF' > "$ISSABEL_MOD_DIR/index.php"
 <?php
-function _moduleContent(&$smarty, $module_name)
+function _moduleContent(&$smarty,$module_name)
 {
     return '<div style="margin:0; padding:0; width:100%; height:calc(100vh - 70px); overflow:hidden;">
                 <iframe src="/op-panel/" style="width:100%; height:100%; border:none; display:block;" allowfullscreen></iframe>
@@ -73,11 +66,10 @@ function _moduleContent(&$smarty, $module_name)
 PHPEOF
 chown -R asterisk:asterisk "$ISSABEL_MOD_DIR"
 
-# Auto-detect exact PBX parent ID (pbxconfig or pbx)
+# Auto-detect exact PBX parent ID (pbxconfig or pbx) and prevent duplicate menu items
 PBX_PARENT=$(sqlite3 /var/www/db/menu.db "SELECT IdParent FROM menu WHERE id IN ('pbxadmin','voicemail','conference','fop2') AND IdParent != '' LIMIT 1;")
 [ -z "$PBX_PARENT" ] && PBX_PARENT="pbxconfig"
 
-# Remove any duplicate or old entries before inserting cleanly
 sqlite3 /var/www/db/menu.db "DELETE FROM menu WHERE Name='Live Operator Panel' OR id='live_operator_panel';"
 sqlite3 /var/www/db/menu.db "INSERT INTO menu (id, IdParent, Link, Name, Type, order_no) VALUES ('live_operator_panel', '$PBX_PARENT', '', 'Live Operator Panel', 'module', 11);"
 
@@ -93,7 +85,6 @@ chmod 775 /var/www/db
 chmod 664 /var/www/db/*.db
 rm -rf /var/www/html/var/templates_c/* /var/lib/php/session/*
 
-echo "[6/6] Configuring Apache Reverse Proxy..."
 SSL_CONF="/etc/httpd/conf.d/ssl.conf"
 if [ -f "$SSL_CONF" ]; then
     sed -i '/op-panel/d' "$SSL_CONF"
@@ -109,4 +100,4 @@ if [ -f "$SSL_CONF" ]; then
 fi
 
 httpd -t && systemctl restart httpd
-echo "Installation Complete! Please log in to Issabel Web GUI and go to PBX -> Live Operator Panel."
+echo "Installation Complete!"
