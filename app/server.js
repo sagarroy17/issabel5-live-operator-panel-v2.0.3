@@ -1,554 +1,598 @@
 const express = require('express');
 const http = require('http');
+const https = require('https');
+const os = require('os');
+const { exec } = require('child_process');
 const { Server } = require('socket.io');
 const mysql = require('mysql2/promise');
 const AsteriskManager = require('asterisk-manager');
-const { exec } = require('child_process');
-const os = require('os');
 const path = require('path');
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: '*' } });
-
-app.use(express.static(path.join(__dirname, 'public')));
+const io = new Server(server, {
+    cors: { origin: '*' }
+});
 
 const dbConfig = {
-    host: '127.0.0.1',
+    host: 'localhost',
     user: 'root',
     password: "MYSQL_PASSWORD_PLACEHOLDER",
-    database: 'asterisk',
-    waitForConnections: true,
-    connectionLimit: 5
+    database: 'asterisk'
 };
 
 const cdrDbConfig = {
-    ...dbConfig,
+    host: 'localhost',
+    user: 'root',
+    password: "MYSQL_PASSWORD_PLACEHOLDER",
     database: 'asteriskcdrdb'
 };
 
-let pool;
-let cdrPool;
-let ami;
-let amiConnected = false;
+const ami = new AsteriskManager(5038, "127.0.0.1", "admin", "AMI_PASSWORD_PLACEHOLDER", true);
+ami.keepConnected();
 
-const state = {
-    peers: {},
-    activeChannels: {},
-    cdrStats: { today: 0, total: 0, perExtToday: {} },
-    systemStats: {
-        cpu: 0,
-        cores: os.cpus().length,
-        ramUsed: '0',
-        ramTotal: (os.totalmem() / 1073741824).toFixed(2),
-        ramPercent: 0,
-        diskUsed: '0G',
-        diskFree: '0G',
-        diskPercent: 0,
-        localIp: '127.0.0.1',
-        publicIp: 'Detecting...',
-        location: 'Dhaka, BD'
-    }
+// In-memory state stores
+const peerStatuses = {};      // { peer: 'IDLE' | 'RINGING' | 'INCALL' }
+const callStartTimes = {};    // { peer: timestamp_ms }
+const callDetails = {};       // { peer: { dir: 'IN' | 'OUT', number: '017...' } }
+const regStatus = {};         // { peer: { registered: bool, ip: string, regSince: timestamp_ms } }
+const channelMap = {};        // { uniqueid: { peer, channel, callerNum, exten, direction } }
+
+// Cached CDR call counts
+let cachedCdrStats = {
+    todayProcessed: 0,
+    totalProcessed: 0
 };
 
-function runCmd(cmd) {
-    return new Promise((resolve) => {
-        exec(cmd, { timeout: 4000 }, (err, stdout) => {
-            resolve(err ? '' : stdout.trim());
+// Cached server network & location metadata
+let cachedPublicIp = 'Detecting...';
+let cachedLocation = Intl.DateTimeFormat().resolvedOptions().timeZone || 'Local Server';
+let prevCpuInfo = os.cpus();
+
+// Normalize AMI command response (handles both Array and String safely)
+function normalizeAmiOut(res) {
+    if (!res) return '';
+    const raw = res.content || res.output || '';
+    return Array.isArray(raw) ? raw.join('\n') : String(raw);
+}
+
+// Fetch Today's Processed Calls and Total Processed Calls from asteriskcdrdb.cdr
+async function refreshCdrStats() {
+    try {
+        const conn = await mysql.createConnection(cdrDbConfig);
+        const [rows] = await conn.execute(`
+            SELECT 
+                COUNT(DISTINCT uniqueid) AS total_calls,
+                COUNT(DISTINCT CASE WHEN DATE(calldate) = CURDATE() THEN uniqueid END) AS today_calls
+            FROM cdr
+        `);
+        await conn.end();
+
+        if (rows && rows.length > 0) {
+            cachedCdrStats = {
+                totalProcessed: Number(rows[0].total_calls) || 0,
+                todayProcessed: Number(rows[0].today_calls) || 0
+            };
+            io.emit('call_summary', getCallSummary());
+        }
+    } catch (err) {
+        console.error('Error fetching CDR call stats:', err.message);
+    }
+}
+refreshCdrStats();
+setInterval(refreshCdrStats, 5000);
+
+// Fetch Public IP and Location metadata periodically (IPv4 forced with fast timeout)
+function refreshPublicIpAndLocation() {
+    https.get('https://ipinfo.io/json', { timeout: 2500, family: 4 }, (res) => {
+        let data = '';
+        res.on('data', chunk => data += chunk);
+        res.on('end', () => {
+            try {
+                const parsed = JSON.parse(data);
+                if (parsed.ip) cachedPublicIp = parsed.ip;
+                if (parsed.city && parsed.country) {
+                    cachedLocation = `${parsed.city}, ${parsed.country}`;
+                } else if (parsed.timezone) {
+                    cachedLocation = parsed.timezone;
+                }
+            } catch (e) {}
+        });
+    }).on('error', () => {
+        https.get('https://api.ipify.org?format=json', { timeout: 2500, family: 4 }, (res2) => {
+            let data2 = '';
+            res2.on('data', chunk => data2 += chunk);
+            res2.on('end', () => {
+                try {
+                    const p2 = JSON.parse(data2);
+                    if (p2.ip) cachedPublicIp = p2.ip;
+                } catch (e) {}
+            });
+        }).on('error', () => {
+            if (cachedPublicIp === 'Detecting...') cachedPublicIp = 'Unavailable';
+        });
+    });
+}
+refreshPublicIpAndLocation();
+setInterval(refreshPublicIpAndLocation, 300000);
+
+// Get local primary IPv4 address
+function getLocalServerIp() {
+    const interfaces = os.networkInterfaces();
+    for (const name of Object.keys(interfaces)) {
+        for (const iface of interfaces[name]) {
+            if (iface.family === 'IPv4' && !iface.internal) {
+                return iface.address;
+            }
+        }
+    }
+    return '127.0.0.1';
+}
+
+// Calculate real-time CPU usage percentage
+function getCpuUsagePercent() {
+    const currCpuInfo = os.cpus();
+    let idleDiff = 0;
+    let totalDiff = 0;
+
+    for (let i = 0; i < currCpuInfo.length; i++) {
+        const prev = prevCpuInfo[i].times;
+        const curr = currCpuInfo[i].times;
+        const prevTotal = prev.user + prev.nice + prev.sys + prev.idle + prev.irq;
+        const currTotal = curr.user + curr.nice + curr.sys + curr.idle + curr.irq;
+        idleDiff += (curr.idle - prev.idle);
+        totalDiff += (currTotal - prevTotal);
+    }
+    prevCpuInfo = currCpuInfo;
+    if (totalDiff === 0) return 0;
+    return Math.max(0, Math.min(100, Math.round(((totalDiff - idleDiff) / totalDiff) * 100)));
+}
+
+// Broadcast System Telemetry (CPU, RAM, Storage, IPs, Location)
+function broadcastSystemStats() {
+    const cpuPercent = getCpuUsagePercent();
+    const cpuCores = os.cpus().length;
+
+    const totalMemBytes = os.totalmem();
+    const freeMemBytes = os.freemem();
+    const usedMemBytes = totalMemBytes - freeMemBytes;
+    const ramPercent = Math.round((usedMemBytes / totalMemBytes) * 100);
+    const usedMemGB = (usedMemBytes / (1024 ** 3)).toFixed(2);
+    const totalMemGB = (totalMemBytes / (1024 ** 3)).toFixed(2);
+
+    exec("df -BG / | tail -1 | awk '{print $2,$3,$4,$5}'", (err, stdout) => {
+        let diskTotal = '0G', diskUsed = '0G', diskFree = '0G', diskPercent = '0%';
+        if (!err && stdout) {
+            const parts = stdout.trim().split(/\s+/);
+            if (parts.length >= 4) {
+                diskTotal = parts[0];
+                diskUsed = parts[1];
+                diskFree = parts[2];
+                diskPercent = parts[3];
+            }
+        }
+
+        io.emit('system_stats', {
+            cpuPercent,
+            cpuCores,
+            ramPercent,
+            usedMemGB,
+            totalMemGB,
+            diskTotal,
+            diskUsed,
+            diskFree,
+            diskPercent,
+            serverIp: getLocalServerIp(),
+            publicIp: cachedPublicIp,
+            location: cachedLocation,
+            serverTimestamp: Date.now()
+        });
+    });
+}
+setInterval(broadcastSystemStats, 2000);
+
+// Extract peer/extension name from channel string (e.g., "PJSIP/101-0000001a" -> "101")
+function extractPeer(channel) {
+    if (!channel) return null;
+    const match = channel.match(/^(?:PJSIP|SIP|IAX2)\/(.+?)(?:-[0-9a-fA-F]+|@.*)?$/i);
+    return match ? match[1].trim() : null;
+}
+
+// Compute live active call count + CDR processed counts
+function getCallSummary() {
+    let activeCalls = 0;
+    const activeChannels = Object.values(channelMap);
+
+    if (activeChannels.length > 0) {
+        const seenBridges = new Set();
+        activeChannels.forEach(ch => {
+            const key = ch.linkedid || ch.uniqueid;
+            if (!seenBridges.has(key)) {
+                seenBridges.add(key);
+                activeCalls++;
+            }
+        });
+    } else {
+        Object.values(peerStatuses).forEach(st => {
+            if (st === 'INCALL' || st === 'RINGING') activeCalls++;
+        });
+    }
+
+    return {
+        totalActive: activeCalls,
+        todayProcessed: cachedCdrStats.todayProcessed,
+        totalProcessed: cachedCdrStats.totalProcessed
+    };
+}
+
+// Broadcast updated extension/trunk call state + summary counts
+function emitPeerUpdate(peer) {
+    if (!peer) return;
+    const status = peerStatuses[peer] || 'IDLE';
+    const startTime = callStartTimes[peer] || null;
+    const callInfo = callDetails[peer] || null;
+    io.emit('ext_status', {
+        exten: peer,
+        status,
+        startTime,
+        callInfo,
+        callSummary: getCallSummary()
+    });
+}
+
+// Parse Asterisk CLI outputs for SIP and PJSIP registration & IP
+function parseRegistrationData(sipOutput, pjsipEndpoints, pjsipContacts) {
+    const currentRegs = {};
+    const now = Date.now();
+
+    if (sipOutput) {
+        sipOutput.split('\n').forEach(line => {
+            const match = line.match(/^(.+?)(?:\/[^\s]+)?\s+(\d+\.\d+\.\d+\.\d+|\(Unspecified\))\s+.*?(OK|Unmonitored)/i);
+            if (match) {
+                const peer = match[1].trim();
+                const ip = match[2] === '(Unspecified)' ? '' : match[2];
+                const isOk = /OK/i.test(match[3]) && ip !== '';
+                currentRegs[peer] = { registered: isOk, ip };
+            }
+        });
+    }
+
+    const contactIpMap = {};
+    if (pjsipContacts) {
+        pjsipContacts.split('\n').forEach(line => {
+            const match = line.match(/Contact:\s+([^\/\s]+)\/sip:[^@]+@(\d+\.\d+\.\d+\.\d+)/i) ||
+                          line.match(/Contact:\s+([^\/\s]+)\/sip:(\d+\.\d+\.\d+\.\d+)/i);
+            if (match) {
+                contactIpMap[match[1].trim()] = match[2];
+            }
+        });
+    }
+
+    if (pjsipEndpoints) {
+        pjsipEndpoints.split('\n').forEach(line => {
+            const match = line.match(/Endpoint:\s+(.+?)(?:\/\S+)?\s+(Not in use|In use|Ringing|Busy|Avail|Unavailable)/i);
+            if (match) {
+                const peer = match[1].trim();
+                const state = match[2];
+                const isReg = !/Unavailable/i.test(state);
+                const ip = contactIpMap[peer] || '';
+                if (!currentRegs[peer] || isReg) {
+                    currentRegs[peer] = { registered: isReg, ip };
+                }
+            }
+        });
+    }
+
+    Object.keys(currentRegs).forEach(peer => {
+        const prev = regStatus[peer];
+        const curr = currentRegs[peer];
+        if (curr.registered) {
+            curr.regSince = (prev && prev.registered && prev.regSince) ? prev.regSince : now;
+        } else {
+            curr.regSince = null;
+        }
+        regStatus[peer] = curr;
+        io.emit('reg_status', { peer, ...curr });
+    });
+}
+
+function pollRegistrations() {
+    let sipOut = '', pjsipEpOut = '', pjsipContactOut = '';
+    ami.action({ action: 'Command', command: 'sip show peers' }, (err, res) => {
+        if (!err && res) sipOut = normalizeAmiOut(res);
+        ami.action({ action: 'Command', command: 'pjsip show endpoints' }, (err2, res2) => {
+            if (!err2 && res2) pjsipEpOut = normalizeAmiOut(res2);
+            ami.action({ action: 'Command', command: 'pjsip show contacts' }, (err3, res3) => {
+                if (!err3 && res3) pjsipContactOut = normalizeAmiOut(res3);
+                parseRegistrationData(sipOut, pjsipEpOut, pjsipContactOut);
+            });
         });
     });
 }
 
-async function initDatabases() {
-    pool = mysql.createPool(dbConfig);
-    cdrPool = mysql.createPool(cdrDbConfig);
-}
+// Reconcile active channels to prevent stale states
+function syncActiveChannels() {
+    ami.action({ action: 'Command', command: 'core show channels concise' }, (err, res) => {
+        if (err || !res) return;
+        const output = normalizeAmiOut(res);
+        const activePeers = new Set();
+        const activeUniqueIds = new Set();
 
-async function loadPeersFromDB() {
-    try {
-        const [users] = await pool.query('SELECT extension, name FROM users ORDER BY CAST(extension AS UNSIGNED), extension');
-        const [trunks] = await pool.query('SELECT trunkid, name, tech, channelid, disabled FROM trunks WHERE disabled = "off" ORDER BY trunkid');
-
-        const freshPeers = {};
-
-        for (const u of users) {
-            const ext = String(u.extension).trim();
-            freshPeers[ext] = {
-                id: ext,
-                name: u.name || ext,
-                type: 'extension',
-                tech: 'PJSIP/SIP',
-                status: 'Unregistered',
-                ip: 'No IP',
-                regTime: null,
-                callState: 'IDLE',
-                callDirection: null,
-                remoteParty: '',
-                callStartTime: null,
-                dailyCalls: state.cdrStats.perExtToday[ext] || 0
-            };
-        }
-
-        for (const t of trunks) {
-            const key = `trunk_${t.trunkid}`;
-            const chanId = (t.channelid || t.name || '').trim();
-            freshPeers[key] = {
-                id: key,
-                trunkName: t.name || chanId,
-                channelId: chanId,
-                type: 'trunk',
-                tech: (t.tech || 'SIP').toUpperCase(),
-                status: 'Offline',
-                ip: 'Trunk',
-                regTime: null,
-                callState: 'IDLE',
-                callDirection: null,
-                remoteParty: '',
-                callStartTime: null
-            };
-        }
-
-        // Preserve existing runtime registration & call states
-        for (const [k, v] of Object.entries(freshPeers)) {
-            if (state.peers[k]) {
-                v.status = state.peers[k].status;
-                v.ip = state.peers[k].ip;
-                v.regTime = state.peers[k].regTime;
-                v.tech = state.peers[k].tech || v.tech;
-            }
-        }
-        state.peers = freshPeers;
-    } catch (e) {
-        console.error('DB Peer Load Error:', e.message);
-    }
-}
-
-async function pollRegistrationStatus() {
-    try {
-        const [pjsipOut, sipOut] = await Promise.all([
-            runCmd('asterisk -rx "pjsip show endpoints"'),
-            runCmd('asterisk -rx "sip show peers"')
-        ]);
-
-        const now = Date.now();
-        const registeredMap = {};
-
-        // Parse PJSIP endpoints (handles Avail, Not in use, In use, Ringing, Busy, etc.)
-        if (pjsipOut) {
-            const lines = pjsipOut.split('\n');
-            let currentEndpoint = null;
-            for (const line of lines) {
-                const epMatch = line.match(/^\s*Endpoint:\s+([^\s\/]+)(?:\/\S+)?\s+(.+)/);
-                if (epMatch) {
-                    currentEndpoint = epMatch[1].trim();
-                    const rest = epMatch[2];
-                    if (/Avail|Not in use|In use|Ringing|Busy/i.test(rest) && !/Unavailable/i.test(rest)) {
-                        registeredMap[currentEndpoint] = { status: 'Registered', ip: 'PJSIP', tech: 'PJSIP' };
-                    }
-                }
-                const contactMatch = line.match(/^\s*Contact:\s+([^\s\/]+)\/sip:(?:[^@]+@)?([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)(?::(\d+))?.*?(Avail|NonQual)/i);
-                if (contactMatch) {
-                    const ep = contactMatch[1].trim();
-                    const ip = contactMatch[2];
-                    registeredMap[ep] = { status: 'Registered', ip, tech: 'PJSIP' };
-                }
-            }
-        }
-
-        // Parse Legacy Chan_SIP peers (handles names with spaces like "BOL ITSP")
-        if (sipOut) {
-            const lines = sipOut.split('\n');
-            for (const line of lines) {
-                const m = line.match(/^(.+?)\s+(\d+\.\d+\.\d+\.\d+|\(Unspecified\))\s+.*?\b(OK|Unmonitored)\b/i);
-                if (m) {
-                    let namePart = m[1].trim();
-                    if (namePart.includes('/')) {
-                        namePart = namePart.split('/')[0].trim();
-                    }
-                    const ip = m[2] === '(Unspecified)' ? 'Unmonitored' : m[2];
-                    if (ip !== 'Unmonitored' || m[3].toUpperCase() === 'OK') {
-                        registeredMap[namePart] = { status: 'Registered', ip, tech: 'SIP' };
-                    }
-                }
-            }
-        }
-
-        for (const peer of Object.values(state.peers)) {
-            const matchKeys = peer.type === 'extension'
-                ? [peer.id]
-                : [peer.channelId, peer.trunkName].filter(Boolean);
-
-            let found = null;
-            for (const k of matchKeys) {
-                if (registeredMap[k]) {
-                    found = registeredMap[k];
-                    break;
-                }
-                const lowerK = k.toLowerCase();
-                for (const [rk, rv] of Object.entries(registeredMap)) {
-                    if (rk.toLowerCase() === lowerK) {
-                        found = rv;
-                        break;
-                    }
-                }
-                if (found) break;
-            }
-
-            if (found) {
-                if (peer.status !== 'Registered') {
-                    peer.regTime = now;
-                }
-                peer.status = 'Registered';
-                peer.ip = found.ip;
-                peer.tech = found.tech;
-            } else {
-                peer.status = peer.type === 'trunk' ? 'Offline' : 'Unregistered';
-                peer.ip = peer.type === 'trunk' ? 'Trunk' : 'No IP';
-                peer.regTime = null;
-            }
-        }
-    } catch (e) {
-        console.error('Poll Registration Error:', e.message);
-    }
-}
-
-function findPeerByChannel(channelName) {
-    if (!channelName) return null;
-    // Channel format: PJSIP/101-00000001 or SIP/BOL ITSP-00000002
-    const techSplit = channelName.split('/');
-    if (techSplit.length < 2) return null;
-    const remainder = techSplit.slice(1).join('/');
-    const lastDash = remainder.lastIndexOf('-');
-    const endpointName = (lastDash > 0 ? remainder.substring(0, lastDash) : remainder).trim();
-
-    if (state.peers[endpointName]) return state.peers[endpointName];
-
-    const lowerEp = endpointName.toLowerCase();
-    for (const peer of Object.values(state.peers)) {
-        if (peer.type === 'extension' && peer.id.toLowerCase() === lowerEp) return peer;
-        if (peer.type === 'trunk') {
-            if ((peer.channelId && peer.channelId.toLowerCase() === lowerEp) ||
-                (peer.trunkName && peer.trunkName.toLowerCase() === lowerEp)) {
-                return peer;
-            }
-        }
-    }
-    return null;
-}
-
-async function pollActiveChannels() {
-    try {
-        const out = await runCmd('asterisk -rx "core show channels concise"');
-        const now = Date.now();
-
-        // Reset call states before recomputing from live channels
-        for (const peer of Object.values(state.peers)) {
-            peer.callState = 'IDLE';
-            peer.callDirection = null;
-            peer.remoteParty = '';
-            peer.callStartTime = null;
-            if (peer.type === 'extension') {
-                peer.dailyCalls = state.cdrStats.perExtToday[peer.id] || 0;
-            }
-        }
-
-        if (!out) {
-            state.activeChannels = {};
-            return;
-        }
-
-        const lines = out.split('\n').filter(Boolean);
-        const channels = [];
-
-        for (const line of lines) {
-            // Concise format: Channel!Context!Extension!Priority!State!Application!Data!CallerID!AccountCode!PeerAccount!AmaFlags!Duration!BridgeId!Uniqueid
+        output.split('\n').forEach(line => {
+            if (!line.includes('!')) return;
             const parts = line.split('!');
-            if (parts.length < 13) continue;
-            channels.push({
-                channel: parts[0],
-                context: (parts[1] || '').toLowerCase(),
-                exten: parts[2] || '',
-                state: parts[4] || '',
-                app: parts[5] || '',
-                appData: parts[6] || '',
-                callerId: parts[7] || '',
-                durationSec: parseInt(parts[11], 10) || 0,
-                bridgeId: parts[12] || ''
-            });
-        }
+            const channel = parts[0];
+            const state = parts[4];
+            const callerNum = parts[7];
+            const uniqueid = parts[11] || channel;
+            const connectedNum = parts[12] || parts[2];
+            const peer = extractPeer(channel);
 
-        // Group channels by BridgeId or Linked channels to correlate Extension <-> Trunk legs accurately
-        const bridgeMap = {};
-        for (const ch of channels) {
-            if (ch.bridgeId) {
-                if (!bridgeMap[ch.bridgeId]) bridgeMap[ch.bridgeId] = [];
-                bridgeMap[ch.bridgeId].push(ch);
-            }
-        }
+            activeUniqueIds.add(uniqueid);
 
-        for (const ch of channels) {
-            const peer = findPeerByChannel(ch.channel);
-            if (!peer) continue;
-
-            const st = ch.state.toLowerCase();
-            let mappedState = 'IN CALL';
-            if (st === 'ringing' || st === 'ring') mappedState = 'RINGING';
-            else if (st === 'up') mappedState = 'IN CALL';
-            else if (st === 'dialing') mappedState = 'DIALING';
-
-            // Determine accurate call direction & remote party
-            let direction = 'IN';
-            let remote = '';
-
-            // Check paired channel in the same bridge first (most accurate for Extension <-> Trunk correlation)
-            const bridgedPeers = (ch.bridgeId && bridgeMap[ch.bridgeId]) ? bridgeMap[ch.bridgeId] : [];
-            const otherLeg = bridgedPeers.find(b => b.channel !== ch.channel);
-
-            if (peer.type === 'trunk') {
-                // Outbound if context indicates dialout/internal OR other leg is an internal extension originating the call
-                const isOutbound = ch.context.includes('dialout') ||
-                    ch.context.includes('from-internal') ||
-                    ch.context.includes('outbound') ||
-                    st === 'dialing' ||
-                    (otherLeg && (otherLeg.context.includes('from-internal') || otherLeg.context.includes('dialout')));
-
-                if (isOutbound) {
-                    direction = 'OUT';
-                    remote = ch.exten && ch.exten !== 's' ? ch.exten : (ch.callerId || '');
-                } else {
-                    direction = 'IN';
-                    remote = ch.callerId || ch.exten || '';
-                }
-            } else {
-                // Extension leg
-                const isInboundQueueOrRingGroup = ch.context.includes('ext-queues') ||
-                    ch.context.includes('ext-group') ||
-                    ch.context.includes('from-trunk') ||
-                    ch.context.includes('from-pstn') ||
-                    ch.context.includes('from-did') ||
-                    st === 'ringing';
-
-                if (isInboundQueueOrRingGroup) {
-                    direction = 'IN';
-                    remote = (otherLeg && otherLeg.callerId) ? otherLeg.callerId : (ch.callerId || '');
-                } else if (ch.context.includes('from-internal') || ch.context.includes('dialout') || st === 'ring' || st === 'dialing') {
-                    // Check if another trunk leg is bridged: if trunk entered from-trunk, then extension is receiving an IN call
-                    const trunkLeg = bridgedPeers.map(b => ({ ch: b, p: findPeerByChannel(b.channel) })).find(x => x.p && x.p.type === 'trunk');
-                    if (trunkLeg && (trunkLeg.ch.context.includes('from-trunk') || trunkLeg.ch.context.includes('from-pstn'))) {
-                        direction = 'IN';
-                        remote = trunkLeg.ch.callerId || ch.callerId || '';
-                    } else {
-                        direction = 'OUT';
-                        remote = (ch.exten && ch.exten !== 's' && ch.exten !== peer.id) ? ch.exten : (otherLeg ? otherLeg.exten : ch.callerId);
+            if (peer) {
+                activePeers.add(peer);
+                if (state === 'Up') {
+                    if (peerStatuses[peer] !== 'INCALL') {
+                        peerStatuses[peer] = 'INCALL';
+                        if (!callStartTimes[peer]) callStartTimes[peer] = Date.now();
                     }
-                } else {
-                    direction = 'IN';
-                    remote = ch.callerId || '';
+                    if (!callDetails[peer]) {
+                        const remote = (connectedNum && connectedNum !== peer && connectedNum !== 's') ? connectedNum : callerNum;
+                        if (remote && remote !== peer && remote !== 's') {
+                            callDetails[peer] = { dir: 'IN', number: remote };
+                        }
+                    }
+                    emitPeerUpdate(peer);
+                } else if (state === 'Ring' || state === 'Ringing') {
+                    if (peerStatuses[peer] !== 'INCALL') {
+                        peerStatuses[peer] = 'RINGING';
+                        emitPeerUpdate(peer);
+                    }
+                }
+            }
+        });
+
+        Object.keys(channelMap).forEach(uid => {
+            if (!activeUniqueIds.has(uid) && !activePeers.has(channelMap[uid].peer)) {
+                delete channelMap[uid];
+            }
+        });
+
+        Object.keys(peerStatuses).forEach(peer => {
+            if (peerStatuses[peer] !== 'IDLE' && !activePeers.has(peer)) {
+                peerStatuses[peer] = 'IDLE';
+                delete callStartTimes[peer];
+                delete callDetails[peer];
+                emitPeerUpdate(peer);
+            }
+        });
+
+        io.emit('call_summary', getCallSummary());
+    });
+}
+
+setInterval(pollRegistrations, 5000);
+setInterval(syncActiveChannels, 4000);
+setTimeout(() => {
+    pollRegistrations();
+    syncActiveChannels();
+    broadcastSystemStats();
+    refreshCdrStats();
+}, 1500);
+
+// Listen to Asterisk AMI Real-Time Events
+ami.on('managerevent', (evt) => {
+    const eventName = evt.event;
+
+    if (eventName === 'Newchannel') {
+        const peer = extractPeer(evt.channel);
+        const callerNum = evt.calleridnum || '';
+        const dialedExten = evt.exten || '';
+        const uid = evt.uniqueid;
+        const linkedid = evt.linkedid || uid;
+
+        if (uid) {
+            channelMap[uid] = {
+                uniqueid: uid,
+                linkedid,
+                peer,
+                channel: evt.channel,
+                callerNum,
+                exten: dialedExten,
+                state: evt.channelstatedesc || 'Ring'
+            };
+        }
+
+        if (peer) {
+            if (callerNum === peer && dialedExten && dialedExten !== 's' && dialedExten !== peer) {
+                callDetails[peer] = { dir: 'OUT', number: dialedExten };
+            } else if (callerNum && callerNum !== peer && callerNum !== 's') {
+                callDetails[peer] = { dir: 'IN', number: callerNum };
+            }
+
+            if (peerStatuses[peer] !== 'INCALL') {
+                peerStatuses[peer] = 'RINGING';
+            }
+            emitPeerUpdate(peer);
+        }
+    }
+
+    if (eventName === 'DialBegin') {
+        const srcPeer = extractPeer(evt.channel);
+        const destPeer = extractPeer(evt.destchannel);
+        const srcCaller = evt.calleridnum || '';
+        const destExten = evt.destcalleridnum || evt.dialstring || destPeer || '';
+
+        if (srcPeer && destExten && destExten !== 's') {
+            const cleanDest = destExten.replace(/^.*\/([^@]+).*$/, '$1');
+            callDetails[srcPeer] = { dir: 'OUT', number: cleanDest };
+            emitPeerUpdate(srcPeer);
+        }
+
+        if (destPeer) {
+            const incomingNum = (srcCaller && srcCaller !== destPeer && srcCaller !== 's') ? srcCaller : srcPeer;
+            if (incomingNum) {
+                callDetails[destPeer] = { dir: 'IN', number: incomingNum };
+            }
+            if (peerStatuses[destPeer] !== 'INCALL') {
+                peerStatuses[destPeer] = 'RINGING';
+            }
+            emitPeerUpdate(destPeer);
+        }
+    }
+
+    if (eventName === 'Newstate') {
+        const peer = extractPeer(evt.channel);
+        const stateDesc = evt.channelstatedesc;
+        const uid = evt.uniqueid;
+        const connectedNum = evt.connectedlinenum || '';
+        const callerNum = evt.calleridnum || '';
+
+        if (uid && channelMap[uid]) {
+            channelMap[uid].state = stateDesc;
+        }
+
+        if (peer) {
+            if (!callDetails[peer]) {
+                const remote = (connectedNum && connectedNum !== peer && connectedNum !== 's') ? connectedNum : callerNum;
+                if (remote && remote !== peer && remote !== 's') {
+                    callDetails[peer] = { dir: 'IN', number: remote };
                 }
             }
 
-            // Clean remote string (strip quotes/brackets if any)
-            remote = String(remote || '').replace(/["<>]/g, '').trim();
-
-            peer.callState = mappedState;
-            peer.callDirection = direction;
-            peer.remoteParty = remote;
-            peer.callStartTime = now - (ch.durationSec * 1000);
-        }
-
-        state.activeChannels = channels;
-    } catch (e) {
-        console.error('Poll Channels Error:', e.message);
-    }
-}
-
-async function pollCdrStats() {
-    try {
-        const [[todayRow]] = await cdrPool.query('SELECT COUNT(*) AS cnt FROM cdr WHERE DATE(calldate) = CURDATE()');
-        const [[totalRow]] = await cdrPool.query('SELECT COUNT(*) AS cnt FROM cdr');
-
-        // Per-extension daily call count (matches src or dst or channel/dstchannel for today)
-        const [rows] = await cdrPool.query(`
-            SELECT src, dst, channel, dstchannel
-            FROM cdr
-            WHERE DATE(calldate) = CURDATE()
-        `);
-
-        const extCounts = {};
-        const extSet = new Set(
-            Object.values(state.peers)
-                .filter(p => p.type === 'extension')
-                .map(p => p.id)
-        );
-
-        for (const r of rows) {
-            const matchedExts = new Set();
-            const src = String(r.src || '').trim();
-            const dst = String(r.dst || '').trim();
-
-            if (extSet.has(src)) matchedExts.add(src);
-            if (extSet.has(dst)) matchedExts.add(dst);
-
-            // Also extract extension from channel/dstchannel (e.g., PJSIP/101-000001)
-            for (const chStr of [r.channel, r.dstchannel]) {
-                if (!chStr) continue;
-                const m = String(chStr).match(/^(?:PJSIP|SIP|IAX2)\/([^-\s@]+)-/i);
-                if (m && extSet.has(m[1])) {
-                    matchedExts.add(m[1]);
+            if (stateDesc === 'Up') {
+                peerStatuses[peer] = 'INCALL';
+                if (!callStartTimes[peer]) callStartTimes[peer] = Date.now();
+                emitPeerUpdate(peer);
+            } else if (stateDesc === 'Ringing' || stateDesc === 'Ring') {
+                if (peerStatuses[peer] !== 'INCALL') {
+                    peerStatuses[peer] = 'RINGING';
+                    emitPeerUpdate(peer);
                 }
             }
-
-            for (const ext of matchedExts) {
-                extCounts[ext] = (extCounts[ext] || 0) + 1;
-            }
         }
-
-        state.cdrStats = {
-            today: todayRow ? todayRow.cnt : 0,
-            total: totalRow ? totalRow.cnt : 0,
-            perExtToday: extCounts
-        };
-
-        for (const peer of Object.values(state.peers)) {
-            if (peer.type === 'extension') {
-                peer.dailyCalls = extCounts[peer.id] || 0;
-            }
-        }
-    } catch (e) {
-        console.error('CDR Poll Error:', e.message);
     }
-}
 
-async function pollSystemStats() {
+    if (eventName === 'BridgeEnter') {
+        const peer = extractPeer(evt.channel);
+        const connectedNum = evt.connectedlinenum || '';
+        const callerNum = evt.calleridnum || '';
+
+        if (peer) {
+            peerStatuses[peer] = 'INCALL';
+            if (!callStartTimes[peer]) callStartTimes[peer] = Date.now();
+            if (!callDetails[peer]) {
+                const remote = (connectedNum && connectedNum !== peer && connectedNum !== 's') ? connectedNum : callerNum;
+                if (remote && remote !== peer && remote !== 's') {
+                    callDetails[peer] = { dir: 'IN', number: remote };
+                }
+            }
+            emitPeerUpdate(peer);
+        }
+    }
+
+    if (eventName === 'Hangup') {
+        const peer = extractPeer(evt.channel);
+        const uid = evt.uniqueid;
+        if (uid) delete channelMap[uid];
+
+        if (peer) {
+            peerStatuses[peer] = 'IDLE';
+            delete callStartTimes[peer];
+            delete callDetails[peer];
+            emitPeerUpdate(peer);
+        }
+        setTimeout(refreshCdrStats, 1000);
+    }
+
+    if (eventName === 'PeerStatus') {
+        const peer = extractPeer(evt.peer);
+        if (peer) {
+            const isReg = /Registered|Reachable/i.test(evt.peerstatus);
+            const ip = evt.address ? evt.address.split(':')[0] : (regStatus[peer]?.ip || '');
+            const prev = regStatus[peer];
+            const regSince = isReg ? ((prev && prev.registered && prev.regSince) ? prev.regSince : Date.now()) : null;
+            regStatus[peer] = { registered: isReg, ip, regSince };
+            io.emit('reg_status', { peer, ...regStatus[peer] });
+        }
+    }
+});
+
+// REST API: Fetch extensions from MySQL
+app.get('/api/extensions', async (req, res) => {
     try {
-        const totalMem = os.totalmem();
-        const freeMem = os.freemem();
-        const usedMem = totalMem - freeMem;
-
-        const [cpuOut, dfOut, ipOut] = await Promise.all([
-            runCmd("top -bn1 | grep 'Cpu(s)' | awk '{print $2 + $4}'"),
-            runCmd("df -h / | awk 'NR==2 {print $3\"|\"$4\"|\"$5}'"),
-            runCmd("hostname -I | awk '{print $1}'")
-        ]);
-
-        const [dUsed, dFree, dPct] = (dfOut || '0G|0G|0%').split('|');
-
-        state.systemStats.cpu = Math.min(100, Math.round(parseFloat(cpuOut) || 0));
-        state.systemStats.ramUsed = (usedMem / 1073741824).toFixed(2);
-        state.systemStats.ramTotal = (totalMem / 1073741824).toFixed(2);
-        state.systemStats.ramPercent = Math.round((usedMem / totalMem) * 100);
-        state.systemStats.diskUsed = dUsed || '0G';
-        state.systemStats.diskFree = dFree || '0G';
-        state.systemStats.diskPercent = parseInt((dPct || '0').replace('%', ''), 10) || 0;
-        if (ipOut) state.systemStats.localIp = ipOut;
-    } catch (e) {
-        // ignore transient errors
+        const conn = await mysql.createConnection(dbConfig);
+        const [rows] = await conn.execute('SELECT extension, name FROM users ORDER BY CAST(extension AS UNSIGNED) ASC');
+        await conn.end();
+        res.json(rows);
+    } catch (err) {
+        console.error('Error fetching extensions:', err);
+        res.status(500).json({ error: err.message });
     }
-}
+});
 
-async function detectPublicIp() {
-    const pub = await runCmd('curl -s --max-time 4 https://api.ipify.org');
-    if (pub && /^\d+\.\d+\.\d+\.\d+$/.test(pub)) {
-        state.systemStats.publicIp = pub;
+// REST API: Fetch trunks from MySQL
+app.get('/api/trunks', async (req, res) => {
+    try {
+        const conn = await mysql.createConnection(dbConfig);
+        const [rows] = await conn.execute('SELECT trunkid, name, tech, channelid FROM trunks WHERE disabled = "off" ORDER BY trunkid ASC');
+        await conn.end();
+        const formatted = rows.map(r => ({
+            key: r.channelid || r.name,
+            name: r.name,
+            tech: r.tech
+        }));
+        res.json(formatted);
+    } catch (err) {
+        console.error('Error fetching trunks:', err);
+        res.status(500).json({ error: err.message });
     }
-}
+});
 
-function connectAMI() {
-    ami = new AsteriskManager(5038, '127.0.0.1', 'admin', "AMI_PASSWORD_PLACEHOLDER", true);
-    ami.keepConnected();
-
-    ami.on('connect', () => {
-        amiConnected = true;
-    });
-
-    ami.on('close', () => {
-        amiConnected = false;
-    });
-
-    ami.on('error', () => {
-        amiConnected = false;
-    });
-
-    ami.on('managerevent', (evt) => {
-        const ev = (evt.event || '').toLowerCase();
-        if (['newchannel', 'newstate', 'hangup', 'bridgeenter', 'bridgeleave', 'dialbegin', 'dialend'].includes(ev)) {
-            pollActiveChannels();
-            if (ev === 'hangup') {
-                setTimeout(pollCdrStats, 1200);
-            }
-        }
-        if (['peerstatus', 'contactstatus'].includes(ev)) {
-            pollRegistrationStatus();
-        }
-    });
-}
-
+// Socket.io Client Connections & Operator Actions
 io.on('connection', (socket) => {
-    socket.emit('state_update', getPayload());
+    socket.emit('initial_state', {
+        statuses: peerStatuses,
+        startTimes: callStartTimes,
+        callDetails: callDetails,
+        registrations: regStatus,
+        callSummary: getCallSummary()
+    });
+    broadcastSystemStats();
 
-    socket.on('hangup_ext', async (extId) => {
-        const out = await runCmd('asterisk -rx "core show channels concise"');
-        for (const line of out.split('\n')) {
-            const ch = line.split('!')[0];
-            if (ch && (ch.includes(`/${extId}-`) || ch.toLowerCase().includes(`/${String(extId).toLowerCase()}-`))) {
-                await runCmd(`asterisk -rx "channel request hangup ${ch}"`);
-            }
-        }
-        setTimeout(pollActiveChannels, 500);
+    // Reset hung extension state
+    socket.on('action_reset', ({ exten }) => {
+        if (!exten) return;
+        peerStatuses[exten] = 'IDLE';
+        delete callStartTimes[exten];
+        delete callDetails[exten];
+        Object.keys(channelMap).forEach(uid => {
+            if (channelMap[uid].peer === exten) delete channelMap[uid];
+        });
+        emitPeerUpdate(exten);
     });
 
-    socket.on('reset_ext', async (extId) => {
-        await runCmd(`asterisk -rx "pjsip send notify reboot-yealink endpoint ${extId}"`);
-        await runCmd(`asterisk -rx "sip notify reboot-yealink ${extId}"`);
-        await pollRegistrationStatus();
-        io.emit('state_update', getPayload());
+    // Hangup active call on target extension
+    socket.on('action_hangup', ({ exten }) => {
+        if (!exten) return;
+        ami.action({ action: 'Command', command: 'core show channels concise' }, (err, res) => {
+            if (err || !res) return;
+            const output = normalizeAmiOut(res);
+            output.split('\n').forEach(line => {
+                if (!line.includes('!')) return;
+                const channel = line.split('!')[0];
+                if (extractPeer(channel) === exten) {
+                    ami.action({ action: 'Hangup', channel: channel });
+                }
+            });
+        });
     });
 });
 
-function getPayload() {
-    const peersList = Object.values(state.peers);
-    const activeCalls = Math.floor(
-        peersList.filter(p => p.type === 'extension' && p.callState !== 'IDLE').length ||
-        peersList.filter(p => p.type === 'trunk' && p.callState !== 'IDLE').length
-    );
+app.use(express.static(path.join(__dirname, 'public')));
 
-    return {
-        amiConnected,
-        activeCalls,
-        todayCalls: state.cdrStats.today,
-        totalCalls: state.cdrStats.total,
-        peers: peersList,
-        systemStats: state.systemStats,
-        serverTime: Date.now()
-    };
-}
-
-(async () => {
-    await initDatabases();
-    await loadPeersFromDB();
-    await pollCdrStats();
-    await pollRegistrationStatus();
-    await pollActiveChannels();
-    await pollSystemStats();
-    detectPublicIp();
-    connectAMI();
-
-    setInterval(async () => {
-        await pollActiveChannels();
-        io.emit('state_update', getPayload());
-    }, 1000);
-
-    setInterval(async () => {
-        await pollRegistrationStatus();
-        await pollSystemStats();
-    }, 5000);
-
-    setInterval(async () => {
-        await loadPeersFromDB();
-        await pollCdrStats();
-    }, 15000);
-
-    server.listen(3050, '127.0.0.1', () => {
-        console.log('Live Operator Panel running on http://127.0.0.1:3050');
-    });
-})();
+const PORT = 3050;
+server.listen(PORT, '127.0.0.1', () => {
+    console.log(`Live Operator Panel listening on port ${PORT}`);
+});
