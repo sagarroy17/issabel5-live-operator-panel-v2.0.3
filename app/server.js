@@ -34,12 +34,13 @@ ami.keepConnected();
 // In-memory state stores
 const peerStatuses = {};      // { peer: 'IDLE' | 'RINGING' | 'INCALL' }
 const callStartTimes = {};    // { peer: timestamp_ms }
-const callDetails = {};       // { peer: { dir: 'IN' | 'OUT', number: '017...' } }
+const callDetails = {};       // { peer: { dir: 'IN' | 'OUT', number: '017...', linkedExten: '524' } }
+const trunkActiveCalls = {};  // { trunkPeer: { [callKey]: { callKey, uniqueid, linkedid, dir, number, exten, status, startTime } } }
 const regStatus = {};         // { peer: { registered: bool, ip: string, regSince: timestamp_ms } }
-const channelMap = {};        // { uniqueid: { peer, channel, callerNum, exten, direction, linkedid, context, isTrunk } }
-const knownTrunks = new Set(); // Track configured trunk keys (case-insensitive via lowercase map)
-const trunkCanonicalMap = {};  // { lowercase_trunk: canonical_trunk_key }
-const knownExtensions = new Set(); // Track configured extension numbers
+const channelMap = {};        // { uniqueid: { uniqueid, peer, channel, callerNum, exten, direction, linkedid, bridgeid, context, isTrunk, state } }
+const knownTrunks = new Set();
+const trunkCanonicalMap = {};
+const knownExtensions = new Set();
 
 // Cached CDR call counts (overall + per-extension today)
 let cachedCdrStats = {
@@ -60,7 +61,19 @@ function normalizeAmiOut(res) {
     return Array.isArray(raw) ? raw.join('\n') : String(raw);
 }
 
-// Refresh known extensions & trunks sets from MySQL for accurate peer/trunk classification
+// Validate real phone/extension number (rejects <unknown>, UUIDs, empty, 's', etc.)
+function isValidNumber(val, excludeSelf = null) {
+    if (!val) return false;
+    const s = String(val).replace(/["<>]/g, '').trim();
+    if (!s) return false;
+    const lower = s.toLowerCase();
+    if (['unknown', 's', 'asterisk', 'anonymous', 'private', 'unavailable', 'none'].includes(lower)) return false;
+    if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s)) return false;
+    if (excludeSelf && s === String(excludeSelf)) return false;
+    return true;
+}
+
+// Refresh known extensions & trunks sets from MySQL
 async function refreshPeerRegistry() {
     try {
         const conn = await mysql.createConnection(dbConfig);
@@ -98,13 +111,159 @@ function isTrunkPeer(peer) {
     return knownTrunks.has(peer) || Boolean(trunkCanonicalMap[peer.toLowerCase()]);
 }
 
+function isExtensionPeer(peer) {
+    if (!peer) return false;
+    return knownExtensions.has(String(peer).trim());
+}
+
 function canonicalPeerName(rawPeer) {
     if (!rawPeer) return null;
-    const trimmed = rawPeer.trim();
+    const trimmed = String(rawPeer).trim();
     if (trunkCanonicalMap[trimmed.toLowerCase()]) {
         return trunkCanonicalMap[trimmed.toLowerCase()];
     }
     return trimmed;
+}
+
+// Extract peer/extension name from channel string
+function extractPeer(channel) {
+    if (!channel) return null;
+    const match = String(channel).match(/^(?:PJSIP|SIP|IAX2)\/(.+?)(?:-[0-9a-fA-F]+|@.*)?$/i);
+    if (!match) return null;
+    return canonicalPeerName(match[1]);
+}
+
+// Find correlated channels sharing the same linkedid or bridgeid
+function getCorrelatedChannels(linkedid, bridgeid = '') {
+    return Object.values(channelMap).filter(c =>
+        (linkedid && c.linkedid === linkedid) ||
+        (bridgeid && c.bridgeid && c.bridgeid === bridgeid)
+    );
+}
+
+// Find extension associated with a given linkedid / bridgeid
+function findLinkedExtension(linkedid, bridgeid = '', excludeExt = null) {
+    const legs = getCorrelatedChannels(linkedid, bridgeid);
+    for (const leg of legs) {
+        if (leg.peer && !leg.isTrunk && isExtensionPeer(leg.peer) && leg.peer !== excludeExt) {
+            return leg.peer;
+        }
+    }
+    // Also check if an extension currently holds callDetails with matching linkedid/bridgeid
+    for (const [p, det] of Object.entries(callDetails)) {
+        if (!isTrunkPeer(p) && isExtensionPeer(p) && p !== excludeExt && det) {
+            if ((linkedid && det.linkedid === linkedid) || (bridgeid && det.bridgeid === bridgeid)) {
+                return p;
+            }
+        }
+    }
+    return '';
+}
+
+// Find best real caller/dialed number across correlated channels
+function resolveLinkedNumber(linkedid, excludePeer, preferDialed = false, bridgeid = '') {
+    const legs = getCorrelatedChannels(linkedid, bridgeid);
+    if (preferDialed) {
+        for (const c of legs) {
+            if (isValidNumber(c.exten, excludePeer) && c.exten.length >= 3) return c.exten;
+        }
+    }
+    const trunkLeg = legs.find(c => c.isTrunk);
+    if (trunkLeg) {
+        if (isValidNumber(trunkLeg.callerNum, excludePeer)) return trunkLeg.callerNum;
+        if (isValidNumber(trunkLeg.exten, excludePeer)) return trunkLeg.exten;
+    }
+    for (const c of legs) {
+        if (isValidNumber(c.callerNum, excludePeer)) return c.callerNum;
+    }
+    for (const c of legs) {
+        if (isValidNumber(c.exten, excludePeer)) return c.exten;
+    }
+    return '';
+}
+
+// Rebuild trunk status & sorted calls array from trunkActiveCalls map
+function syncTrunkFromMap(trunkPeer) {
+    if (!trunkPeer || !isTrunkPeer(trunkPeer)) return;
+    const map = trunkActiveCalls[trunkPeer] || {};
+    const callsList = Object.values(map).sort((a, b) => (a.startTime || 0) - (b.startTime || 0));
+
+    // Refresh linkedExten on every active trunk call
+    callsList.forEach(c => {
+        const linkedExt = findLinkedExtension(c.linkedid, c.bridgeid);
+        if (linkedExt) c.exten = linkedExt;
+    });
+
+    if (callsList.length === 0) {
+        peerStatuses[trunkPeer] = 'IDLE';
+        delete callStartTimes[trunkPeer];
+        delete callDetails[trunkPeer];
+        delete trunkActiveCalls[trunkPeer];
+        return;
+    }
+
+    const hasInCall = callsList.some(c => c.status === 'INCALL');
+    peerStatuses[trunkPeer] = hasInCall ? 'INCALL' : 'RINGING';
+
+    // Earliest call start time for trunk badge timer, plus full calls array for multi-call display
+    const earliestStart = callsList.reduce((min, c) => (!min || (c.startTime && c.startTime < min)) ? c.startTime : min, null);
+    if (earliestStart) {
+        callStartTimes[trunkPeer] = earliestStart;
+    }
+
+    const primary = callsList[callsList.length - 1];
+    callDetails[trunkPeer] = {
+        dir: primary.dir || 'IN',
+        number: primary.number || '',
+        exten: primary.exten || '',
+        linkedid: primary.linkedid || '',
+        bridgeid: primary.bridgeid || '',
+        calls: callsList
+    };
+}
+
+// Upsert or update a call entry inside a trunk's active calls map
+function upsertTrunkCall(trunkPeer, callKey, patch) {
+    if (!trunkPeer || !isTrunkPeer(trunkPeer) || !callKey) return;
+    if (!trunkActiveCalls[trunkPeer]) trunkActiveCalls[trunkPeer] = {};
+    const existing = trunkActiveCalls[trunkPeer][callKey] || {
+        callKey,
+        uniqueid: callKey,
+        linkedid: callKey,
+        bridgeid: '',
+        dir: 'IN',
+        number: '',
+        exten: '',
+        status: 'RINGING',
+        startTime: Date.now()
+    };
+
+    const merged = { ...existing, ...patch };
+    if (!isValidNumber(merged.number, trunkPeer) && isValidNumber(existing.number, trunkPeer)) {
+        merged.number = existing.number;
+    }
+    if (!merged.exten && existing.exten) {
+        merged.exten = existing.exten;
+    }
+    if (!merged.startTime) {
+        merged.startTime = Date.now();
+    }
+
+    trunkActiveCalls[trunkPeer][callKey] = merged;
+    syncTrunkFromMap(trunkPeer);
+}
+
+// Remove a call entry from a trunk when channel/call hangs up
+function removeTrunkCall(trunkPeer, uid, linkedid = '') {
+    if (!trunkPeer || !trunkActiveCalls[trunkPeer]) return;
+    const map = trunkActiveCalls[trunkPeer];
+    Object.keys(map).forEach(k => {
+        const item = map[k];
+        if (k === uid || item.uniqueid === uid || (linkedid && item.linkedid === linkedid && !channelMap[item.uniqueid])) {
+            delete map[k];
+        }
+    });
+    syncTrunkFromMap(trunkPeer);
 }
 
 // Fetch Today's Processed Calls, Total Processed Calls & Per-Extension Daily Calls from asteriskcdrdb.cdr
@@ -125,7 +284,6 @@ async function refreshCdrStats() {
         `);
         await conn.end();
 
-        // Count distinct uniqueid calls per extension for today (both incoming & outgoing)
         const extCallSets = {};
         todayRows.forEach(r => {
             const uid = r.uniqueid;
@@ -278,20 +436,6 @@ function broadcastSystemStats() {
 }
 setInterval(broadcastSystemStats, 2000);
 
-// Extract peer/extension name from channel string (e.g., "PJSIP/101-0000001a" -> "101", "SIP/BOL ITSP-00001" -> "BOL ITSP")
-function extractPeer(channel) {
-    if (!channel) return null;
-    const match = String(channel).match(/^(?:PJSIP|SIP|IAX2)\/(.+?)(?:-[0-9a-fA-F]+|@.*)?$/i);
-    if (!match) return null;
-    return canonicalPeerName(match[1]);
-}
-
-// Find correlated channels sharing the same linkedid
-function getLinkedChannels(linkedid) {
-    if (!linkedid) return [];
-    return Object.values(channelMap).filter(c => c.linkedid === linkedid);
-}
-
 // Compute live active call count + CDR processed counts + per-extension daily counts
 function getCallSummary() {
     let activeCalls = 0;
@@ -323,6 +467,9 @@ function getCallSummary() {
 // Broadcast updated extension/trunk call state + summary counts
 function emitPeerUpdate(peer) {
     if (!peer) return;
+    if (isTrunkPeer(peer)) {
+        syncTrunkFromMap(peer);
+    }
     const status = peerStatuses[peer] || 'IDLE';
     const startTime = callStartTimes[peer] || null;
     const callInfo = callDetails[peer] || null;
@@ -332,6 +479,16 @@ function emitPeerUpdate(peer) {
         startTime,
         callInfo,
         callSummary: getCallSummary()
+    });
+}
+
+// Notify all trunks linked to a specific extension so their linked extension label updates live
+function refreshTrunksForExtension(extPeer) {
+    Object.keys(trunkActiveCalls).forEach(trPeer => {
+        const calls = Object.values(trunkActiveCalls[trPeer] || {});
+        if (calls.some(c => c.exten === extPeer || (!c.exten && channelMap[c.uniqueid]))) {
+            emitPeerUpdate(trPeer);
+        }
     });
 }
 
@@ -405,13 +562,14 @@ function pollRegistrations() {
     });
 }
 
-// Reconcile active channels to prevent stale states & ensure accurate direction
+// Reconcile active channels to prevent stale states & ensure accurate multi-call trunk + direction state
 function syncActiveChannels() {
     ami.action({ action: 'Command', command: 'core show channels concise' }, (err, res) => {
         if (err || !res) return;
         const output = normalizeAmiOut(res);
         const activePeers = new Set();
         const activeUniqueIds = new Set();
+        const seenTrunkCallKeysByPeer = {};
 
         output.split('\n').forEach(line => {
             if (!line.includes('!')) return;
@@ -423,35 +581,83 @@ function syncActiveChannels() {
             const callerNum = parts[7];
             const uniqueid = parts[11] || channel;
             const connectedNum = parts[12] || exten;
+            const bridgeId = parts[13] || '';
             const peer = extractPeer(channel);
 
             activeUniqueIds.add(uniqueid);
+            if (channelMap[uniqueid] && bridgeId) {
+                channelMap[uniqueid].bridgeid = bridgeId;
+            }
 
             if (peer) {
                 activePeers.add(peer);
                 const trunkFlag = isTrunkPeer(peer);
+                const mappedSt = state === 'Up' ? 'INCALL' : ((state === 'Ring' || state === 'Ringing') ? 'RINGING' : 'INCALL');
 
-                if (state === 'Up') {
-                    if (peerStatuses[peer] !== 'INCALL') {
-                        peerStatuses[peer] = 'INCALL';
-                        if (!callStartTimes[peer]) callStartTimes[peer] = Date.now();
-                    }
-                    if (!callDetails[peer]) {
-                        const remote = (connectedNum && connectedNum !== peer && connectedNum !== 's') ? connectedNum : callerNum;
-                        if (remote && remote !== peer && remote !== 's') {
-                            // If trunk and context is dialout/internal -> OUT; if extension and context is dialout/from-internal -> OUT
-                            const isOut = context.includes('dialout') || context.includes('outbound') ||
-                                          (!trunkFlag && context.includes('from-internal') && exten !== peer && exten !== 's');
-                            callDetails[peer] = { dir: isOut ? 'OUT' : 'IN', number: remote };
+                if (trunkFlag) {
+                    const existingEntry = (trunkActiveCalls[peer] && trunkActiveCalls[peer][uniqueid]) || null;
+                    const linkedid = existingEntry ? existingEntry.linkedid : ((channelMap[uniqueid] && channelMap[uniqueid].linkedid) || uniqueid);
+                    const isOut = context.includes('dialout') || context.includes('outbound') || (existingEntry && existingEntry.dir === 'OUT');
+                    const remote = isValidNumber(connectedNum, peer) ? connectedNum : (isValidNumber(callerNum, peer) ? callerNum : (existingEntry ? existingEntry.number : ''));
+                    const linkedExt = findLinkedExtension(linkedid, bridgeId) || (existingEntry ? existingEntry.exten : '');
+
+                    if (!seenTrunkCallKeysByPeer[peer]) seenTrunkCallKeysByPeer[peer] = new Set();
+                    seenTrunkCallKeysByPeer[peer].add(uniqueid);
+
+                    upsertTrunkCall(peer, uniqueid, {
+                        uniqueid,
+                        linkedid,
+                        bridgeid: bridgeId || (existingEntry ? existingEntry.bridgeid : ''),
+                        dir: isOut ? 'OUT' : 'IN',
+                        number: remote,
+                        exten: linkedExt,
+                        status: mappedSt,
+                        startTime: existingEntry ? existingEntry.startTime : Date.now()
+                    });
+                    emitPeerUpdate(peer);
+                } else {
+                    if (state === 'Up') {
+                        if (peerStatuses[peer] !== 'INCALL') {
+                            peerStatuses[peer] = 'INCALL';
+                            if (!callStartTimes[peer]) callStartTimes[peer] = Date.now();
+                        }
+                        if (!callDetails[peer]) {
+                            const remote = isValidNumber(connectedNum, peer) ? connectedNum : (isValidNumber(callerNum, peer) ? callerNum : '');
+                            if (isValidNumber(remote, peer)) {
+                                const isOut = context.includes('dialout') || context.includes('outbound') || (context.includes('from-internal') && exten !== peer && exten !== 's');
+                                callDetails[peer] = {
+                                    dir: isOut ? 'OUT' : 'IN',
+                                    number: remote,
+                                    linkedid: (channelMap[uniqueid] && channelMap[uniqueid].linkedid) || uniqueid,
+                                    bridgeid
+                                };
+                            }
+                        }
+                        emitPeerUpdate(peer);
+                        refreshTrunksForExtension(peer);
+                    } else if (state === 'Ring' || state === 'Ringing') {
+                        if (peerStatuses[peer] !== 'INCALL') {
+                            peerStatuses[peer] = 'RINGING';
+                            emitPeerUpdate(peer);
                         }
                     }
-                    emitPeerUpdate(peer);
-                } else if (state === 'Ring' || state === 'Ringing') {
-                    if (peerStatuses[peer] !== 'INCALL') {
-                        peerStatuses[peer] = 'RINGING';
-                        emitPeerUpdate(peer);
-                    }
                 }
+            }
+        });
+
+        // Clean up stale trunk calls that are no longer active
+        Object.keys(trunkActiveCalls).forEach(trPeer => {
+            const validSet = seenTrunkCallKeysByPeer[trPeer] || new Set();
+            let changed = false;
+            Object.keys(trunkActiveCalls[trPeer]).forEach(ck => {
+                if (!validSet.has(ck) && !activeUniqueIds.has(ck)) {
+                    delete trunkActiveCalls[trPeer][ck];
+                    changed = true;
+                }
+            });
+            if (changed) {
+                syncTrunkFromMap(trPeer);
+                emitPeerUpdate(trPeer);
             }
         });
 
@@ -462,7 +668,7 @@ function syncActiveChannels() {
         });
 
         Object.keys(peerStatuses).forEach(peer => {
-            if (peerStatuses[peer] !== 'IDLE' && !activePeers.has(peer)) {
+            if (!isTrunkPeer(peer) && peerStatuses[peer] !== 'IDLE' && !activePeers.has(peer)) {
                 peerStatuses[peer] = 'IDLE';
                 delete callStartTimes[peer];
                 delete callDetails[peer];
@@ -497,13 +703,15 @@ ami.on('managerevent', (evt) => {
         const trunkFlag = isTrunkPeer(peer);
 
         if (uid) {
+            const existing = channelMap[uid] || {};
             channelMap[uid] = {
                 uniqueid: uid,
                 linkedid,
+                bridgeid: existing.bridgeid || '',
                 peer,
                 channel: evt.channel,
-                callerNum,
-                exten: dialedExten,
+                callerNum: isValidNumber(callerNum) ? callerNum : (existing.callerNum || ''),
+                exten: isValidNumber(dialedExten) ? dialedExten : (existing.exten || ''),
                 context,
                 isTrunk: trunkFlag,
                 state: evt.channelstatedesc || 'Ring'
@@ -511,39 +719,50 @@ ami.on('managerevent', (evt) => {
         }
 
         if (peer) {
-            const linked = getLinkedChannels(linkedid);
+            const linked = getCorrelatedChannels(linkedid);
             const originatingExtLeg = linked.find(c => !c.isTrunk && c.peer && (c.context.includes('from-internal') || c.context.includes('dialout')));
             const incomingTrunkLeg = linked.find(c => c.isTrunk && (c.context.includes('from-trunk') || c.context.includes('from-pstn') || c.context.includes('from-did')));
 
             if (trunkFlag) {
-                // Trunk channel created: if linked to an outbound internal extension leg, trunk is OUT; otherwise IN
-                if (originatingExtLeg || context.includes('dialout') || context.includes('from-internal') || context.includes('outbound')) {
-                    const outNum = (originatingExtLeg && originatingExtLeg.exten && originatingExtLeg.exten !== 's')
+                const isOut = Boolean(originatingExtLeg || context.includes('dialout') || context.includes('from-internal') || context.includes('outbound'));
+                const num = isOut
+                    ? ((originatingExtLeg && isValidNumber(originatingExtLeg.exten, peer))
                         ? originatingExtLeg.exten
-                        : ((dialedExten && dialedExten !== 's') ? dialedExten : callerNum);
-                    if (outNum) callDetails[peer] = { dir: 'OUT', number: outNum };
-                } else {
-                    const inNum = (callerNum && callerNum !== peer && callerNum !== 's') ? callerNum : dialedExten;
-                    if (inNum) callDetails[peer] = { dir: 'IN', number: inNum };
-                }
-            } else {
-                // Extension channel created
-                if (incomingTrunkLeg || context.includes('ext-queues') || context.includes('ext-group') || context.includes('from-trunk') || context.includes('from-pstn')) {
-                    const externalCaller = (incomingTrunkLeg && incomingTrunkLeg.callerNum) ? incomingTrunkLeg.callerNum : callerNum;
-                    if (externalCaller && externalCaller !== peer && externalCaller !== 's') {
-                        callDetails[peer] = { dir: 'IN', number: externalCaller };
-                    }
-                } else if (callerNum === peer && dialedExten && dialedExten !== 's' && dialedExten !== peer) {
-                    callDetails[peer] = { dir: 'OUT', number: dialedExten };
-                } else if (callerNum && callerNum !== peer && callerNum !== 's') {
-                    callDetails[peer] = { dir: 'IN', number: callerNum };
-                }
-            }
+                        : (isValidNumber(dialedExten, peer) ? dialedExten : resolveLinkedNumber(linkedid, peer, true)))
+                    : (isValidNumber(callerNum, peer) ? callerNum : (isValidNumber(dialedExten, peer) ? dialedExten : resolveLinkedNumber(linkedid, peer, false)));
 
-            if (peerStatuses[peer] !== 'INCALL') {
-                peerStatuses[peer] = 'RINGING';
+                const linkedExt = findLinkedExtension(linkedid);
+                upsertTrunkCall(peer, uid || linkedid, {
+                    uniqueid: uid || linkedid,
+                    linkedid,
+                    dir: isOut ? 'OUT' : 'IN',
+                    number: isValidNumber(num, peer) ? num : '',
+                    exten: linkedExt,
+                    status: evt.channelstatedesc === 'Up' ? 'INCALL' : 'RINGING',
+                    startTime: Date.now()
+                });
+                emitPeerUpdate(peer);
+            } else {
+                if (incomingTrunkLeg || context.includes('ext-queues') || context.includes('ext-group') || context.includes('from-trunk') || context.includes('from-pstn')) {
+                    const externalCaller = resolveLinkedNumber(linkedid, peer, false) || (isValidNumber(callerNum, peer) ? callerNum : '');
+                    if (isValidNumber(externalCaller, peer)) {
+                        callDetails[peer] = { dir: 'IN', number: externalCaller, linkedid };
+                    }
+                } else if (callerNum === peer && isValidNumber(dialedExten, peer)) {
+                    callDetails[peer] = { dir: 'OUT', number: dialedExten, linkedid };
+                } else if (isValidNumber(callerNum, peer)) {
+                    callDetails[peer] = { dir: 'IN', number: callerNum, linkedid };
+                } else {
+                    const fallbackNum = resolveLinkedNumber(linkedid, peer, false);
+                    if (isValidNumber(fallbackNum, peer)) callDetails[peer] = { dir: 'IN', number: fallbackNum, linkedid };
+                }
+
+                if (peerStatuses[peer] !== 'INCALL') {
+                    peerStatuses[peer] = 'RINGING';
+                }
+                emitPeerUpdate(peer);
+                refreshTrunksForExtension(peer);
             }
-            emitPeerUpdate(peer);
         }
     }
 
@@ -553,51 +772,57 @@ ami.on('managerevent', (evt) => {
         const srcCaller = evt.calleridnum || '';
         const destExten = evt.destcalleridnum || evt.dialstring || destPeer || '';
         const linkedid = evt.linkedid || evt.uniqueid;
-        const linked = getLinkedChannels(linkedid);
+        const destUid = evt.destuniqueid || evt.uniqueid;
+        const linked = getCorrelatedChannels(linkedid);
         const incomingTrunkLeg = linked.find(c => c.isTrunk && (c.context.includes('from-trunk') || c.context.includes('from-pstn') || c.context.includes('from-did')));
 
-        // 1. Source leg (e.g., Extension dialing out, or Queue/RingGroup dialing an agent)
+        // 1. Source leg (Extension dialing out, or Queue/RingGroup dialing an agent)
         if (srcPeer && !isTrunkPeer(srcPeer)) {
             if (incomingTrunkLeg) {
-                // Call originated from an external trunk (via IVR / Queue / Ring Group) -> Extension is receiving IN call
-                const extCaller = incomingTrunkLeg.callerNum || srcCaller;
-                if (extCaller && extCaller !== srcPeer && extCaller !== 's') {
-                    callDetails[srcPeer] = { dir: 'IN', number: extCaller };
+                const extCaller = resolveLinkedNumber(linkedid, srcPeer, false) || (isValidNumber(srcCaller, srcPeer) ? srcCaller : '');
+                if (isValidNumber(extCaller, srcPeer)) {
+                    callDetails[srcPeer] = { dir: 'IN', number: extCaller, linkedid };
                     emitPeerUpdate(srcPeer);
                 }
-            } else if (destExten && destExten !== 's') {
-                const cleanDest = destExten.replace(/^.*\/([^@]+).*$/, '$1');
-                if (cleanDest !== srcPeer) {
-                    callDetails[srcPeer] = { dir: 'OUT', number: cleanDest };
+            } else {
+                const rawDest = isValidNumber(evt.destcalleridnum, srcPeer) ? evt.destcalleridnum : (isValidNumber(destPeer, srcPeer) ? destPeer : resolveLinkedNumber(linkedid, srcPeer, true));
+                const cleanDest = String(rawDest || '').replace(/^.*\/([^@]+).*$/, '$1');
+                if (isValidNumber(cleanDest, srcPeer)) {
+                    callDetails[srcPeer] = { dir: 'OUT', number: cleanDest, linkedid };
                     emitPeerUpdate(srcPeer);
                 }
             }
         }
 
-        // 2. Destination leg (either an Outbound Trunk being dialed OR an Extension receiving a call)
+        // 2. Destination leg (Outbound Trunk being dialed OR Extension receiving a call)
         if (destPeer) {
             if (isTrunkPeer(destPeer)) {
-                // Trunk is being dialed by an internal extension -> Trunk shows OUT with dialed number
-                const dialedNumber = (callDetails[srcPeer] && callDetails[srcPeer].number)
+                const dialedNumber = (callDetails[srcPeer] && isValidNumber(callDetails[srcPeer].number, destPeer))
                     ? callDetails[srcPeer].number
-                    : destExten.replace(/^.*\/([^@]+).*$/, '$1');
-                if (dialedNumber && dialedNumber !== 's') {
-                    callDetails[destPeer] = { dir: 'OUT', number: dialedNumber };
-                }
+                    : resolveLinkedNumber(linkedid, destPeer, true);
+                const extNum = (!isTrunkPeer(srcPeer) && isExtensionPeer(srcPeer)) ? srcPeer : findLinkedExtension(linkedid);
+                upsertTrunkCall(destPeer, destUid, {
+                    uniqueid: destUid,
+                    linkedid,
+                    dir: 'OUT',
+                    number: isValidNumber(dialedNumber, destPeer) ? dialedNumber : '',
+                    exten: extNum,
+                    status: 'RINGING',
+                    startTime: Date.now()
+                });
+                emitPeerUpdate(destPeer);
             } else {
-                // Extension is being dialed (direct, from Queue, or from Ring Group) -> Extension shows IN with external/internal caller
-                const incomingNum = (incomingTrunkLeg && incomingTrunkLeg.callerNum)
-                    ? incomingTrunkLeg.callerNum
-                    : ((srcCaller && srcCaller !== destPeer && srcCaller !== 's') ? srcCaller : srcPeer);
-                if (incomingNum) {
-                    callDetails[destPeer] = { dir: 'IN', number: incomingNum };
+                const incomingNum = resolveLinkedNumber(linkedid, destPeer, false)
+                    || (isValidNumber(srcCaller, destPeer) ? srcCaller : (isValidNumber(srcPeer, destPeer) ? srcPeer : ''));
+                if (isValidNumber(incomingNum, destPeer)) {
+                    callDetails[destPeer] = { dir: 'IN', number: incomingNum, linkedid };
                 }
+                if (peerStatuses[destPeer] !== 'INCALL') {
+                    peerStatuses[destPeer] = 'RINGING';
+                }
+                emitPeerUpdate(destPeer);
+                refreshTrunksForExtension(destPeer);
             }
-
-            if (peerStatuses[destPeer] !== 'INCALL') {
-                peerStatuses[destPeer] = 'RINGING';
-            }
-            emitPeerUpdate(destPeer);
         }
     }
 
@@ -614,25 +839,43 @@ ami.on('managerevent', (evt) => {
         }
 
         if (peer) {
-            if (!callDetails[peer]) {
-                const linked = getLinkedChannels(linkedid);
-                const incomingTrunkLeg = linked.find(c => c.isTrunk && (c.context.includes('from-trunk') || c.context.includes('from-pstn')));
-                const remote = (incomingTrunkLeg && incomingTrunkLeg.callerNum)
-                    ? incomingTrunkLeg.callerNum
-                    : ((connectedNum && connectedNum !== peer && connectedNum !== 's') ? connectedNum : callerNum);
-                if (remote && remote !== peer && remote !== 's') {
-                    callDetails[peer] = { dir: 'IN', number: remote };
-                }
-            }
+            if (isTrunkPeer(peer)) {
+                const st = stateDesc === 'Up' ? 'INCALL' : 'RINGING';
+                const linkedExt = findLinkedExtension(linkedid);
+                const existingCall = trunkActiveCalls[peer] && trunkActiveCalls[peer][uid];
+                const remote = resolveLinkedNumber(linkedid, peer, existingCall && existingCall.dir === 'OUT')
+                    || (isValidNumber(connectedNum, peer) ? connectedNum : (isValidNumber(callerNum, peer) ? callerNum : ''));
 
-            if (stateDesc === 'Up') {
-                peerStatuses[peer] = 'INCALL';
-                if (!callStartTimes[peer]) callStartTimes[peer] = Date.now();
+                upsertTrunkCall(peer, uid, {
+                    uniqueid: uid,
+                    linkedid,
+                    number: isValidNumber(remote, peer) ? remote : '',
+                    exten: linkedExt,
+                    status: st,
+                    startTime: existingCall ? existingCall.startTime : Date.now()
+                });
                 emitPeerUpdate(peer);
-            } else if (stateDesc === 'Ringing' || stateDesc === 'Ring') {
-                if (peerStatuses[peer] !== 'INCALL') {
-                    peerStatuses[peer] = 'RINGING';
+            } else {
+                if (!callDetails[peer]) {
+                    const remote = resolveLinkedNumber(linkedid, peer, false)
+                        || (isValidNumber(connectedNum, peer) ? connectedNum : (isValidNumber(callerNum, peer) ? callerNum : ''));
+                    if (isValidNumber(remote, peer)) {
+                        callDetails[peer] = { dir: 'IN', number: remote, linkedid };
+                    }
+                } else {
+                    callDetails[peer].linkedid = linkedid;
+                }
+
+                if (stateDesc === 'Up') {
+                    peerStatuses[peer] = 'INCALL';
+                    if (!callStartTimes[peer]) callStartTimes[peer] = Date.now();
                     emitPeerUpdate(peer);
+                    refreshTrunksForExtension(peer);
+                } else if (stateDesc === 'Ringing' || stateDesc === 'Ring') {
+                    if (peerStatuses[peer] !== 'INCALL') {
+                        peerStatuses[peer] = 'RINGING';
+                        emitPeerUpdate(peer);
+                    }
                 }
             }
         }
@@ -641,37 +884,68 @@ ami.on('managerevent', (evt) => {
     if (eventName === 'BridgeEnter') {
         const peer = extractPeer(evt.channel);
         const uid = evt.uniqueid;
-        const linkedid = evt.linkedid || (channelMap[uid] && channelMap[uid].linkedid);
+        const bridgeid = evt.bridgeuniqueid || '';
+        const linkedid = evt.linkedid || (channelMap[uid] && channelMap[uid].linkedid) || uid;
         const connectedNum = evt.connectedlinenum || '';
         const callerNum = evt.calleridnum || '';
 
+        if (uid && channelMap[uid] && bridgeid) {
+            channelMap[uid].bridgeid = bridgeid;
+        }
+
         if (peer) {
-            peerStatuses[peer] = 'INCALL';
-            if (!callStartTimes[peer]) callStartTimes[peer] = Date.now();
-            if (!callDetails[peer]) {
-                const linked = getLinkedChannels(linkedid);
-                const incomingTrunkLeg = linked.find(c => c.isTrunk && (c.context.includes('from-trunk') || c.context.includes('from-pstn')));
-                const remote = (incomingTrunkLeg && incomingTrunkLeg.callerNum)
-                    ? incomingTrunkLeg.callerNum
-                    : ((connectedNum && connectedNum !== peer && connectedNum !== 's') ? connectedNum : callerNum);
-                if (remote && remote !== peer && remote !== 's') {
-                    callDetails[peer] = { dir: 'IN', number: remote };
+            if (isTrunkPeer(peer)) {
+                const linkedExt = findLinkedExtension(linkedid, bridgeid);
+                const existingCall = trunkActiveCalls[peer] && trunkActiveCalls[peer][uid];
+                const remote = resolveLinkedNumber(linkedid, peer, existingCall && existingCall.dir === 'OUT', bridgeid)
+                    || (isValidNumber(connectedNum, peer) ? connectedNum : (isValidNumber(callerNum, peer) ? callerNum : ''));
+
+                upsertTrunkCall(peer, uid, {
+                    uniqueid: uid,
+                    linkedid,
+                    bridgeid,
+                    number: isValidNumber(remote, peer) ? remote : '',
+                    exten: linkedExt,
+                    status: 'INCALL',
+                    startTime: existingCall ? existingCall.startTime : Date.now()
+                });
+                emitPeerUpdate(peer);
+            } else {
+                peerStatuses[peer] = 'INCALL';
+                if (!callStartTimes[peer]) callStartTimes[peer] = Date.now();
+                if (!callDetails[peer]) {
+                    const remote = resolveLinkedNumber(linkedid, peer, false, bridgeid)
+                        || (isValidNumber(connectedNum, peer) ? connectedNum : (isValidNumber(callerNum, peer) ? callerNum : ''));
+                    if (isValidNumber(remote, peer)) {
+                        callDetails[peer] = { dir: 'IN', number: remote, linkedid, bridgeid };
+                    }
+                } else {
+                    callDetails[peer].linkedid = linkedid;
+                    callDetails[peer].bridgeid = bridgeid;
                 }
+                emitPeerUpdate(peer);
+                refreshTrunksForExtension(peer);
             }
-            emitPeerUpdate(peer);
         }
     }
 
     if (eventName === 'Hangup') {
         const peer = extractPeer(evt.channel);
         const uid = evt.uniqueid;
+        const linkedid = evt.linkedid || (channelMap[uid] && channelMap[uid].linkedid) || '';
         if (uid) delete channelMap[uid];
 
         if (peer) {
-            peerStatuses[peer] = 'IDLE';
-            delete callStartTimes[peer];
-            delete callDetails[peer];
-            emitPeerUpdate(peer);
+            if (isTrunkPeer(peer)) {
+                removeTrunkCall(peer, uid, linkedid);
+                emitPeerUpdate(peer);
+            } else {
+                peerStatuses[peer] = 'IDLE';
+                delete callStartTimes[peer];
+                delete callDetails[peer];
+                emitPeerUpdate(peer);
+                refreshTrunksForExtension(peer);
+            }
         }
         setTimeout(refreshCdrStats, 1000);
     }
@@ -741,6 +1015,7 @@ io.on('connection', (socket) => {
             if (channelMap[uid].peer === exten) delete channelMap[uid];
         });
         emitPeerUpdate(exten);
+        refreshTrunksForExtension(exten);
     });
 
     // Hangup active call on target extension
